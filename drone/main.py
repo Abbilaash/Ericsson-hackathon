@@ -2,20 +2,21 @@ import time
 import uuid
 import threading
 import socket
+import json
 
 # =========================
 # CONFIG
 # =========================
 
-DRONE_ID = "drone_01"
+DRONE_ID = "drone_01"  # Change this for each drone
 ROLE = "drone"
-BROADCAST_PORT = 9999  # Same port for all devices to send/receive
+DISCOVERY_PORT = 9998  # Port for device discovery
+MESSAGE_PORT = 9999    # Port for message communication
 
-# Get your machine's actual network IP
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))  # Connect to Google DNS
+        s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -23,27 +24,24 @@ def get_local_ip():
         return "127.0.0.1"
 
 LOCAL_IP = get_local_ip()
-
-print(f"[DRONE] Local IP Address: {LOCAL_IP}")
-print(f"[DRONE] Broadcast Port: {BROADCAST_PORT}")
-
 BATTERY_THRESHOLD = 25.0
 
+print(f"[DRONE] Drone ID: {DRONE_ID}")
+print(f"[DRONE] Local IP: {LOCAL_IP}")
+print(f"[DRONE] Discovery Port: {DISCOVERY_PORT}")
+print(f"[DRONE] Message Port: {MESSAGE_PORT}")
+
 # =========================
-# STATE / LEDGER
+# STATE
 # =========================
 
-known_drones = {}
-known_robots = {}
+known_devices = {}  # {device_id: {"ip": "x.x.x.x", "role": "drone/robot", "last_seen": timestamp}}
 tasks = {}
-
 battery_pct = 80.0
-busy = False
-
-
+device_lock = threading.Lock()
 
 # =========================
-# UTILITIES
+# NETWORK UTILITIES
 # =========================
 
 def now():
@@ -52,25 +50,47 @@ def now():
 def gen_message_id():
     return f"{DRONE_ID}_{now()}"
 
-def send_to_network(payload):
-    """Send message via UDP broadcast to entire network"""
-    import json
+def send_discovery_beacon():
+    """Broadcast presence to discover other devices"""
     try:
-        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Use full broadcast address (reaches all subnets)
-        broadcast_addr = '<broadcast>'
+        beacon = json.dumps({
+            "type": "DISCOVERY",
+            "device_id": DRONE_ID,
+            "role": ROLE,
+            "ip": LOCAL_IP,
+            "timestamp": now()
+        }).encode('utf-8')
         
-        message = json.dumps(payload).encode('utf-8')
-        broadcast_socket.sendto(message, (broadcast_addr, BROADCAST_PORT))
-        broadcast_socket.close()
-        
-        print(f"[DRONE] 📤 SENT BROADCAST to port {BROADCAST_PORT}")
-        
+        sock.sendto(beacon, ('<broadcast>', DISCOVERY_PORT))
+        sock.close()
     except Exception as e:
-        print(f"[DRONE] ❌ Broadcast failed: {e}")
+        print(f"[DRONE] Discovery beacon failed: {e}")
+
+def send_message_to_device(device_ip, payload):
+    """Send message directly to a specific device"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        message = json.dumps(payload).encode('utf-8')
+        sock.sendto(message, (device_ip, MESSAGE_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[DRONE] Failed to send to {device_ip}: {e}")
+
+def send_to_network(payload):
+    """Send message to all known devices"""
+    with device_lock:
+        device_list = list(known_devices.items())
+    
+    if not device_list:
+        print(f"[DRONE] No devices found in network")
+        return
+    
+    print(f"[DRONE] 📤 Sending to {len(device_list)} device(s)")
+    for device_id, info in device_list:
+        send_message_to_device(info["ip"], payload)
 
 # =========================
 # MESSAGE BUILDERS
@@ -83,20 +103,14 @@ def build_request(task=None, reason="WORK_REQUEST"):
         "message_type": "REQUEST",
         "sender_id": DRONE_ID,
         "sender_role": ROLE,
+        "sender_ip": LOCAL_IP,
         "timestamp": now(),
-
         "receiver_category": ["robot", "drone"],
-
-        "available_drones": list(known_drones.keys()) + [DRONE_ID],
-        "available_robots": list(known_robots.keys()),
-
         "task": task,
-
         "sender_health": {
             "battery_pct": battery_pct,
             "power_state": "LOW" if battery_pct < BATTERY_THRESHOLD else "NORMAL"
         },
-
         "request_reason": reason,
         "ttl_sec": 30
     }
@@ -108,10 +122,9 @@ def build_ack(task_id, decision):
         "message_type": "ACK",
         "sender_id": DRONE_ID,
         "sender_role": ROLE,
+        "sender_ip": LOCAL_IP,
         "timestamp": now(),
-
         "receiver_category": ["drone"],
-
         "acknowledged_task_id": task_id,
         "decision": decision
     }
@@ -121,121 +134,159 @@ def build_ack(task_id, decision):
 # =========================
 
 def detect_fault_event():
-    """Simulated detection trigger"""
+    """Simulated fault detection"""
     task = {
         "task_id": f"fault_{uuid.uuid4().hex[:6]}",
         "task_type": "antenna_tilt",
         "confidence": 0.93,
         "severity": 0.6,
-        "coordinates": {
-            "frame": "tower_map",
-            "x": 0.34,
-            "y": -0.12,
-            "z": 1.82
-        },
         "time_detected": now(),
-        "status": "UNCLAIMED",
-        "claimed_by": None,
-        "precision_required": True
+        "status": "UNCLAIMED"
     }
     tasks[task["task_id"]] = task
-    print(f"[DRONE] Fault detected: {task['task_id']}")
+    print(f"\n[DRONE] ⚠️ Fault detected: {task['task_id']}")
     send_to_network(build_request(task=task, reason="WORK_REQUEST"))
 
 def battery_monitor():
+    """Monitor battery and trigger handover when low"""
     global battery_pct
     while True:
         time.sleep(5)
         battery_pct -= 1.0
-
-        if battery_pct < BATTERY_THRESHOLD:
-            print("\n" + "="*60)
-            print(f"[DRONE] 🔋 CRITICAL: Battery at {battery_pct}% - Sending HANDOVER request to all drones")
-            print("="*60 + "\n")
-            handover_msg = build_request(reason="DRONE_HANDOVER")
-            print(f"[DRONE] Handover message frame to send:")
-            print(f"  {handover_msg}\n")
-            send_to_network(handover_msg)
-            break  # stop further operation
-
-def announce_join():
-    print("[DRONE] Joining network")
-    send_to_network(build_request(reason="DRONE_JOIN"))
-
-def listen_for_broadcasts():
-    """Listen for UDP broadcast messages from other devices"""
-    import json
-    try:
-        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        broadcast_socket.bind(("", BROADCAST_PORT))  # Listen on broadcast port
         
-        print(f"[DRONE] 📡 Listening for broadcast messages on port {BROADCAST_PORT}...")
+        if battery_pct < BATTERY_THRESHOLD:
+            print(f"\n{'='*60}")
+            print(f"[DRONE] 🔋 CRITICAL: Battery at {battery_pct}%")
+            print(f"[DRONE] Requesting handover to all drones")
+            print(f"{'='*60}\n")
+            
+            send_to_network(build_request(reason="DRONE_HANDOVER"))
+            break
+
+# =========================
+# LISTENERS
+# =========================
+
+def discovery_listener():
+    """Listen for device discovery beacons"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", DISCOVERY_PORT))
+        
+        print(f"[DRONE] 🔍 Discovery listener started on port {DISCOVERY_PORT}")
         
         while True:
             try:
-                data, addr = broadcast_socket.recvfrom(4096)
+                data, addr = sock.recvfrom(1024)
+                beacon = json.loads(data.decode('utf-8'))
+                
+                if beacon.get("type") == "DISCOVERY":
+                    device_id = beacon.get("device_id")
+                    
+                    if device_id == DRONE_ID:
+                        continue  # Ignore own beacon
+                    
+                    with device_lock:
+                        known_devices[device_id] = {
+                            "ip": beacon.get("ip"),
+                            "role": beacon.get("role"),
+                            "last_seen": now()
+                        }
+                    
+                    print(f"[DRONE] 🔍 Discovered device: {device_id} at {beacon.get('ip')}")
+                    
+            except Exception as e:
+                pass
+                
+    except Exception as e:
+        print(f"[DRONE] Discovery listener failed: {e}")
+
+def message_listener():
+    """Listen for messages from other devices"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", MESSAGE_PORT))
+        
+        print(f"[DRONE] 📨 Message listener started on port {MESSAGE_PORT}")
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
                 msg = json.loads(data.decode('utf-8'))
+                
                 sender_id = msg.get("sender_id")
-                
                 if sender_id == DRONE_ID:
-                    continue  # Ignore own messages
+                    continue
                 
-                # Process broadcast message
                 msg_type = msg.get("message_type")
                 request_reason = msg.get("request_reason")
                 
                 print(f"\n{'='*70}")
-                print(f"[DRONE] 📡 RECEIVED BROADCAST from {sender_id} (Source: {addr[0]}:{addr[1]})")
+                print(f"[DRONE] 📨 RECEIVED from {sender_id} ({addr[0]})")
                 print(f"{'='*70}")
-                print(f"Message Type: {msg_type}")
-                print(f"Request Reason: {request_reason}")
-                print(f"Timestamp: {msg.get('timestamp')}")
-                print(f"Message ID: {msg.get('message_id')}")
-                print(f"\nFull Message Frame:")
-                print(f"{msg}")
+                print(f"Type: {msg_type} | Reason: {request_reason}")
+                print(f"Message: {msg}")
                 print(f"{'='*70}\n")
                 
-                if msg_type == "REQUEST":
-                    if msg.get("sender_role") == "drone":
-                        known_drones[sender_id] = msg.get("sender_health", {})
-                        if request_reason == "DRONE_HANDOVER":
-                            print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical\n")
-                    elif msg.get("sender_role") == "robot":
-                        known_robots[sender_id] = msg.get("robot_status", {})
-                            
+                # Update device registry
+                if msg.get("sender_ip"):
+                    with device_lock:
+                        known_devices[sender_id] = {
+                            "ip": msg.get("sender_ip"),
+                            "role": msg.get("sender_role"),
+                            "last_seen": now()
+                        }
+                
+                # Handle specific message types
+                if msg_type == "REQUEST" and request_reason == "DRONE_HANDOVER":
+                    print(f"[DRONE] 🔋 ALERT: {sender_id} needs battery replacement!\n")
+                
             except Exception as e:
-                print(f"[DRONE] Error processing broadcast: {e}")
+                print(f"[DRONE] Error processing message: {e}")
                 
     except Exception as e:
-        print(f"[DRONE] ❌ Failed to start broadcast listener: {e}")
+        print(f"[DRONE] Message listener failed: {e}")
+
+def periodic_discovery():
+    """Periodically broadcast presence"""
+    while True:
+        send_discovery_beacon()
+        time.sleep(5)  # Send beacon every 5 seconds
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    print(f"[DRONE] Starting drone {DRONE_ID}...")
-    print(f"[DRONE] Running on {LOCAL_IP}")
-    print(f"[DRONE] Broadcasting on port {BROADCAST_PORT}")
+    print(f"\n{'='*60}")
+    print(f"[DRONE] Starting {DRONE_ID}")
+    print(f"{'='*60}\n")
     
-    # Start background threads
+    # Start all background threads
+    threading.Thread(target=discovery_listener, daemon=True).start()
+    threading.Thread(target=message_listener, daemon=True).start()
+    threading.Thread(target=periodic_discovery, daemon=True).start()
     threading.Thread(target=battery_monitor, daemon=True).start()
-    threading.Thread(target=listen_for_broadcasts, daemon=True).start()
     
-    # Wait a moment for listener to start
-    time.sleep(1)
+    # Wait for listeners to start
+    time.sleep(2)
     
-    # Announce join
-    announce_join()
-
-    # Simulate a fault after startup (for demo)
+    # Announce presence
+    print(f"[DRONE] 📡 Announcing presence to network\n")
+    send_discovery_beacon()
+    
+    # Simulate fault detection after 10 seconds
     threading.Timer(10, detect_fault_event).start()
-
+    
     # Keep main thread alive
     try:
         while True:
-            time.sleep(1)
+            time.sleep(10)
+            # Show known devices
+            with device_lock:
+                if known_devices:
+                    print(f"\n[DRONE] 📋 Known devices: {list(known_devices.keys())}")
     except KeyboardInterrupt:
-        print("\n[DRONE] Shutting down...")
+        print(f"\n[DRONE] Shutting down {DRONE_ID}...")
