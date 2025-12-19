@@ -64,11 +64,32 @@ def gen_message_id():
     return f"{DRONE_ID}_{now()}"
 
 def send_to_network(payload):
+    # Send unicast to specific nodes
     for node in NETWORK_NODES:
         try:
             requests.post(f"{node}/message", json=payload, timeout=1)
         except Exception:
             pass  # allowed to fail
+    
+    # Also broadcast to entire network
+    broadcast_message(payload)
+
+def broadcast_message(payload):
+    """Send message via UDP broadcast to entire network"""
+    import json
+    try:
+        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        # Get subnet broadcast address (e.g., 192.168.1.255)
+        broadcast_addr = ".".join(LOCAL_IP.split(".")[:3]) + ".255"
+        
+        message = json.dumps(payload).encode('utf-8')
+        broadcast_socket.sendto(message, (broadcast_addr, 9999))
+        broadcast_socket.close()
+    except Exception as e:
+        pass  # allowed to fail
 
 # =========================
 # MESSAGE BUILDERS
@@ -160,6 +181,48 @@ def announce_join():
     print("[DRONE] Joining network")
     send_to_network(build_request(reason="DRONE_JOIN"))
 
+def listen_for_broadcasts():
+    """Listen for UDP broadcast messages from other devices"""
+    import json
+    broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    broadcast_socket.bind(("", 9999))  # Listen on port 9999
+    
+    print("[DRONE] 📡 Listening for broadcast messages on port 9999...")
+    
+    while True:
+        try:
+            data, addr = broadcast_socket.recvfrom(4096)
+            msg = json.loads(data.decode('utf-8'))
+            sender_id = msg.get("sender_id")
+            
+            if sender_id == DRONE_ID:
+                continue  # Ignore own messages
+            
+            # Process broadcast message same as unicast
+            msg_type = msg.get("message_type")
+            request_reason = msg.get("request_reason")
+            
+            print(f"\n{'='*70}")
+            print(f"[DRONE] 📡 BROADCAST MESSAGE from {sender_id} (Source: {addr[0]})")
+            print(f"{'='*70}")
+            print(f"Message Type: {msg_type}")
+            print(f"Request Reason: {request_reason}")
+            print(f"Timestamp: {msg.get('timestamp')}")
+            print(f"Message ID: {msg.get('message_id')}")
+            print(f"\nFull Message Frame:")
+            print(f"{msg}")
+            print(f"{'='*70}\n")
+            
+            if msg_type == "REQUEST":
+                if msg.get("sender_role") == "drone":
+                    known_drones[sender_id] = msg.get("sender_health", {})
+                    if request_reason == "DRONE_HANDOVER":
+                        print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical\n")
+                        
+        except Exception as e:
+            pass  # allowed to fail
+
 # =========================
 # RECEIVER
 # =========================
@@ -214,6 +277,7 @@ if __name__ == "__main__":
     announce_join()
 
     threading.Thread(target=battery_monitor, daemon=True).start()
+    threading.Thread(target=listen_for_broadcasts, daemon=True).start()
 
     # Simulate a fault after startup (for demo)
     threading.Timer(10, detect_fault_event).start()
