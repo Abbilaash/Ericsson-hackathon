@@ -2,6 +2,7 @@ import time
 import uuid
 import threading
 import requests
+import socket
 from flask import Flask, request, jsonify
 
 # =========================
@@ -12,10 +13,26 @@ DRONE_ID = "drone_01"
 ROLE = "drone"
 PORT = 8001
 
+# Get your machine's actual network IP
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # Connect to Google DNS
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+LOCAL_IP = get_local_ip()
+
+# Update these to match actual device IPs on your network
 NETWORK_NODES = [
-    "http://127.0.0.1:8000",  # control center
-    "http://127.0.0.1:8002",  # robot_01
+    f"http://{LOCAL_IP}:8000",  # control center (change IP if on different device)
+    f"http://{LOCAL_IP}:8002",  # robot_01 (change IP if on different device)
 ]
+
+print(f"[DRONE] Local IP Address: {LOCAL_IP}")
 
 BATTERY_THRESHOLD = 25.0
 
@@ -151,24 +168,31 @@ def announce_join():
 def receive_message():
     msg = request.json
     sender_id = msg.get("sender_id")
-
-    # Print received message frame
-    print(f"\n[DRONE] Received message frame from {sender_id}:")
-    print(f"  Message: {msg}\n")
+    msg_type = msg.get("message_type")
+    request_reason = msg.get("request_reason")
 
     if sender_id == DRONE_ID:
         return jsonify({"status": "ignored"}), 200
 
-    msg_type = msg.get("message_type")
-    request_reason = msg.get("request_reason")
+    # Print received message frame with detailed info
+    print(f"\n{'='*70}")
+    print(f"[DRONE] ✉️  RECEIVED MESSAGE from {sender_id}")
+    print(f"{'='*70}")
+    print(f"Message Type: {msg_type}")
+    print(f"Request Reason: {request_reason}")
+    print(f"Timestamp: {msg.get('timestamp')}")
+    print(f"Message ID: {msg.get('message_id')}")
+    print(f"\nFull Message Frame:")
+    print(f"{msg}")
+    print(f"{'='*70}\n")
 
     if msg_type == "REQUEST":
-        if msg["sender_role"] == "drone":
+        if msg.get("sender_role") == "drone":
             known_drones[sender_id] = msg.get("sender_health", {})
             # Handle DRONE_HANDOVER specifically
             if request_reason == "DRONE_HANDOVER":
-                print(f"[DRONE] HANDOVER REQUEST from {sender_id} - Battery critical, drone needs replacement")
-        elif msg["sender_role"] == "robot":
+                print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical, drone needs replacement\n")
+        elif msg.get("sender_role") == "robot":
             known_robots[sender_id] = msg.get("robot_status", {})
 
     elif msg_type == "ACK":
@@ -178,7 +202,7 @@ def receive_message():
         if decision == "ACCEPTED" and task_id in tasks:
             tasks[task_id]["status"] = "CLAIMED"
             tasks[task_id]["claimed_by"] = sender_id
-            print(f"[DRONE] Task {task_id} claimed by {sender_id}")
+            print(f"[DRONE] ✅ Task {task_id} claimed by {sender_id}\n")
 
     return jsonify({"status": "ok"}), 200
 
@@ -194,5 +218,6 @@ if __name__ == "__main__":
     # Simulate a fault after startup (for demo)
     threading.Timer(10, detect_fault_event).start()
 
-    print(f"[DRONE] Running on port {PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+    print(f"[DRONE] Running on {LOCAL_IP}:{PORT}")
+    print(f"[DRONE] Network nodes: {NETWORK_NODES}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
