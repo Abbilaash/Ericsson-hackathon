@@ -130,8 +130,13 @@ def battery_monitor():
         battery_pct -= 1.0
 
         if battery_pct < BATTERY_THRESHOLD:
-            print("[DRONE] Battery low → requesting handover")
-            send_to_network(build_request(reason="DRONE_HANDOVER"))
+            print("\n" + "="*60)
+            print(f"[DRONE] 🔋 CRITICAL: Battery at {battery_pct}% - Sending HANDOVER request to all drones")
+            print("="*60 + "\n")
+            handover_msg = build_request(reason="DRONE_HANDOVER")
+            print(f"[DRONE] Handover message frame to send:")
+            print(f"  {handover_msg}\n")
+            send_to_network(handover_msg)
             break  # stop further operation
 
 def announce_join():
@@ -147,14 +152,22 @@ def receive_message():
     msg = request.json
     sender_id = msg.get("sender_id")
 
+    # Print received message frame
+    print(f"\n[DRONE] Received message frame from {sender_id}:")
+    print(f"  Message: {msg}\n")
+
     if sender_id == DRONE_ID:
         return jsonify({"status": "ignored"}), 200
 
     msg_type = msg.get("message_type")
+    request_reason = msg.get("request_reason")
 
     if msg_type == "REQUEST":
         if msg["sender_role"] == "drone":
             known_drones[sender_id] = msg.get("sender_health", {})
+            # Handle DRONE_HANDOVER specifically
+            if request_reason == "DRONE_HANDOVER":
+                print(f"[DRONE] HANDOVER REQUEST from {sender_id} - Battery critical, drone needs replacement")
         elif msg["sender_role"] == "robot":
             known_robots[sender_id] = msg.get("robot_status", {})
 
