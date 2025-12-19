@@ -165,14 +165,6 @@ def announce_join():
 def listen_for_broadcasts():
     """Listen for UDP broadcast messages from other devices"""
     import json
-    broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    broadcast_socket.bind(("", 9999))  # Listen on port 9999
-    
-    print("[DRONE] 📡 Listening for broadcast messages on port 9999...")
-    
-    while True:
-        try:
     try:
         broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -204,26 +196,26 @@ def listen_for_broadcasts():
                 print(f"\nFull Message Frame:")
                 print(f"{msg}")
                 print(f"{'='*70}\n")
-
-
-        if decision == "ACCEPTED" and task_id in tasks:
-            tasks[task_id]["status"] = "CLAIMED"
-            tasks[task_id]["claimed_by"] = sender_id
-            print(f"[DRONE] ✅ Task {task_id} claimed by {sender_id}\n")
-
-    return jsonify({"status": "ok"}), 200
+                
+                if msg_type == "REQUEST":
+                    if msg.get("sender_role") == "drone":
+                        known_drones[sender_id] = msg.get("sender_health", {})
+                        if request_reason == "DRONE_HANDOVER":
+                            print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical\n")
+                    elif msg.get("sender_role") == "robot":
+                        known_robots[sender_id] = msg.get("robot_status", {})
+                            
+            except Exception as e:
+                print(f"[DRONE] Error processing broadcast: {e}")
+                
+    except Exception as e:
+        print(f"[DRONE] ❌ Failed to start broadcast listener: {e}")
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    announce_join()
-
-    threading.Thread(target=battery_monitor, daemon=True).start()
-    threading.Thread(target=listen_for_broadcasts, daemon=True).start()
-
-    # Simulate a fault after startup (for demo)
     print(f"[DRONE] Starting drone {DRONE_ID}...")
     print(f"[DRONE] Running on {LOCAL_IP}")
     print(f"[DRONE] Broadcasting on port {BROADCAST_PORT}")
@@ -246,4 +238,4 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[DRONE] Shutting down..."
+        print("\n[DRONE] Shutting down...")
