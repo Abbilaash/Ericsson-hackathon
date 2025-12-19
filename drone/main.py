@@ -1,9 +1,7 @@
 import time
 import uuid
 import threading
-import requests
 import socket
-from flask import Flask, request, jsonify
 
 # =========================
 # CONFIG
@@ -11,7 +9,7 @@ from flask import Flask, request, jsonify
 
 DRONE_ID = "drone_01"
 ROLE = "drone"
-PORT = 8001
+BROADCAST_PORT = 9999  # Same port for all devices to send/receive
 
 # Get your machine's actual network IP
 def get_local_ip():
@@ -26,13 +24,8 @@ def get_local_ip():
 
 LOCAL_IP = get_local_ip()
 
-# Update these to match actual device IPs on your network
-NETWORK_NODES = [
-    f"http://{LOCAL_IP}:8000",  # control center (change IP if on different device)
-    f"http://{LOCAL_IP}:8002",  # robot_01 (change IP if on different device)
-]
-
 print(f"[DRONE] Local IP Address: {LOCAL_IP}")
+print(f"[DRONE] Broadcast Port: {BROADCAST_PORT}")
 
 BATTERY_THRESHOLD = 25.0
 
@@ -47,11 +40,7 @@ tasks = {}
 battery_pct = 80.0
 busy = False
 
-# =========================
-# FLASK APP
-# =========================
 
-app = Flask(__name__)
 
 # =========================
 # UTILITIES
@@ -64,17 +53,6 @@ def gen_message_id():
     return f"{DRONE_ID}_{now()}"
 
 def send_to_network(payload):
-    # Send unicast to specific nodes
-    for node in NETWORK_NODES:
-        try:
-            requests.post(f"{node}/message", json=payload, timeout=1)
-        except Exception:
-            pass  # allowed to fail
-    
-    # Also broadcast to entire network
-    broadcast_message(payload)
-
-def broadcast_message(payload):
     """Send message via UDP broadcast to entire network"""
     import json
     try:
@@ -82,14 +60,17 @@ def broadcast_message(payload):
         broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        # Get subnet broadcast address (e.g., 192.168.1.255)
-        broadcast_addr = ".".join(LOCAL_IP.split(".")[:3]) + ".255"
+        # Use full broadcast address (reaches all subnets)
+        broadcast_addr = '<broadcast>'
         
         message = json.dumps(payload).encode('utf-8')
-        broadcast_socket.sendto(message, (broadcast_addr, 9999))
+        broadcast_socket.sendto(message, (broadcast_addr, BROADCAST_PORT))
         broadcast_socket.close()
+        
+        print(f"[DRONE] 📤 SENT BROADCAST to port {BROADCAST_PORT}")
+        
     except Exception as e:
-        pass  # allowed to fail
+        print(f"[DRONE] ❌ Broadcast failed: {e}")
 
 # =========================
 # MESSAGE BUILDERS
@@ -192,75 +173,38 @@ def listen_for_broadcasts():
     
     while True:
         try:
-            data, addr = broadcast_socket.recvfrom(4096)
-            msg = json.loads(data.decode('utf-8'))
-            sender_id = msg.get("sender_id")
-            
-            if sender_id == DRONE_ID:
-                continue  # Ignore own messages
-            
-            # Process broadcast message same as unicast
-            msg_type = msg.get("message_type")
-            request_reason = msg.get("request_reason")
-            
-            print(f"\n{'='*70}")
-            print(f"[DRONE] 📡 BROADCAST MESSAGE from {sender_id} (Source: {addr[0]})")
-            print(f"{'='*70}")
-            print(f"Message Type: {msg_type}")
-            print(f"Request Reason: {request_reason}")
-            print(f"Timestamp: {msg.get('timestamp')}")
-            print(f"Message ID: {msg.get('message_id')}")
-            print(f"\nFull Message Frame:")
-            print(f"{msg}")
-            print(f"{'='*70}\n")
-            
-            if msg_type == "REQUEST":
-                if msg.get("sender_role") == "drone":
-                    known_drones[sender_id] = msg.get("sender_health", {})
-                    if request_reason == "DRONE_HANDOVER":
-                        print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical\n")
-                        
-        except Exception as e:
-            pass  # allowed to fail
+    try:
+        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        broadcast_socket.bind(("", BROADCAST_PORT))  # Listen on broadcast port
+        
+        print(f"[DRONE] 📡 Listening for broadcast messages on port {BROADCAST_PORT}...")
+        
+        while True:
+            try:
+                data, addr = broadcast_socket.recvfrom(4096)
+                msg = json.loads(data.decode('utf-8'))
+                sender_id = msg.get("sender_id")
+                
+                if sender_id == DRONE_ID:
+                    continue  # Ignore own messages
+                
+                # Process broadcast message
+                msg_type = msg.get("message_type")
+                request_reason = msg.get("request_reason")
+                
+                print(f"\n{'='*70}")
+                print(f"[DRONE] 📡 RECEIVED BROADCAST from {sender_id} (Source: {addr[0]}:{addr[1]})")
+                print(f"{'='*70}")
+                print(f"Message Type: {msg_type}")
+                print(f"Request Reason: {request_reason}")
+                print(f"Timestamp: {msg.get('timestamp')}")
+                print(f"Message ID: {msg.get('message_id')}")
+                print(f"\nFull Message Frame:")
+                print(f"{msg}")
+                print(f"{'='*70}\n")
 
-# =========================
-# RECEIVER
-# =========================
-
-@app.route("/message", methods=["POST"])
-def receive_message():
-    msg = request.json
-    sender_id = msg.get("sender_id")
-    msg_type = msg.get("message_type")
-    request_reason = msg.get("request_reason")
-
-    if sender_id == DRONE_ID:
-        return jsonify({"status": "ignored"}), 200
-
-    # Print received message frame with detailed info
-    print(f"\n{'='*70}")
-    print(f"[DRONE] ✉️  RECEIVED MESSAGE from {sender_id}")
-    print(f"{'='*70}")
-    print(f"Message Type: {msg_type}")
-    print(f"Request Reason: {request_reason}")
-    print(f"Timestamp: {msg.get('timestamp')}")
-    print(f"Message ID: {msg.get('message_id')}")
-    print(f"\nFull Message Frame:")
-    print(f"{msg}")
-    print(f"{'='*70}\n")
-
-    if msg_type == "REQUEST":
-        if msg.get("sender_role") == "drone":
-            known_drones[sender_id] = msg.get("sender_health", {})
-            # Handle DRONE_HANDOVER specifically
-            if request_reason == "DRONE_HANDOVER":
-                print(f"[DRONE] 🔋 ALERT: HANDOVER REQUEST from {sender_id} - Battery critical, drone needs replacement\n")
-        elif msg.get("sender_role") == "robot":
-            known_robots[sender_id] = msg.get("robot_status", {})
-
-    elif msg_type == "ACK":
-        task_id = msg.get("acknowledged_task_id")
-        decision = msg.get("decision")
 
         if decision == "ACCEPTED" and task_id in tasks:
             tasks[task_id]["status"] = "CLAIMED"
@@ -280,8 +224,26 @@ if __name__ == "__main__":
     threading.Thread(target=listen_for_broadcasts, daemon=True).start()
 
     # Simulate a fault after startup (for demo)
+    print(f"[DRONE] Starting drone {DRONE_ID}...")
+    print(f"[DRONE] Running on {LOCAL_IP}")
+    print(f"[DRONE] Broadcasting on port {BROADCAST_PORT}")
+    
+    # Start background threads
+    threading.Thread(target=battery_monitor, daemon=True).start()
+    threading.Thread(target=listen_for_broadcasts, daemon=True).start()
+    
+    # Wait a moment for listener to start
+    time.sleep(1)
+    
+    # Announce join
+    announce_join()
+
+    # Simulate a fault after startup (for demo)
     threading.Timer(10, detect_fault_event).start()
 
-    print(f"[DRONE] Running on {LOCAL_IP}:{PORT}")
-    print(f"[DRONE] Network nodes: {NETWORK_NODES}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    # Keep main thread alive
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[DRONE] Shutting down..."
