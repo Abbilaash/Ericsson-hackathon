@@ -2,16 +2,19 @@ import time
 import uuid
 import threading
 import socket
+import fxn
 import json
 
 # =========================
 # CONFIG
 # =========================
 
-DRONE_ID = "drone_01"  # Change this for each drone
+# TODO: check with the base station for unique drone ID
+
+DRONE_ID = "drone_01"
 ROLE = "drone"
-DISCOVERY_PORT = 9998  # Port for device discovery
-MESSAGE_PORT = 9999    # Port for message communication
+DISCOVERY_PORT = 9998
+MESSAGE_PORT = 9999 
 
 def get_local_ip():
     try:
@@ -24,7 +27,7 @@ def get_local_ip():
         return "127.0.0.1"
 
 LOCAL_IP = get_local_ip()
-BATTERY_THRESHOLD = 25.0
+BATTERY_THRESHOLD = 20.0
 
 print(f"[DRONE] Drone ID: {DRONE_ID}")
 print(f"[DRONE] Local IP: {LOCAL_IP}")
@@ -37,7 +40,7 @@ print(f"[DRONE] Message Port: {MESSAGE_PORT}")
 
 known_devices = {}  # {device_id: {"ip": "x.x.x.x", "role": "drone/robot", "last_seen": timestamp}}
 tasks = {}
-battery_pct = 80.0
+battery_pct = fxn.get_battery_percentage() or 90.0
 device_lock = threading.Lock()
 
 # =========================
@@ -96,6 +99,10 @@ def send_to_network(payload):
 # MESSAGE BUILDERS
 # =========================
 
+# TODO: add location details when sending work_requests
+
+# TODO: implement object detection
+
 def build_request(task=None, reason="WORK_REQUEST"):
     return {
         "schema_version": "1.0",
@@ -114,6 +121,22 @@ def build_request(task=None, reason="WORK_REQUEST"):
         "request_reason": reason,
         "ttl_sec": 30
     }
+
+def build_drone_handover_request():
+    return {
+        "schema_version": "1.0",
+        "message_id": gen_message_id(),
+        "message_type": "REQUEST",
+        "sender_id": DRONE_ID,
+        "sender_role": ROLE,
+        "sender_ip": LOCAL_IP,
+        "timestamp": now(),
+        "receiver_category": ["drone"],
+        "request_reason": "DRONE_HANDOVER",
+        "ttl_sec": 30
+    }
+
+# TODO: ask other drones to verify the fault (when confidence is too low)
 
 def build_ack(task_id, decision):
     return {
@@ -274,7 +297,7 @@ if __name__ == "__main__":
     time.sleep(2)
     
     # Announce presence
-    print(f"[DRONE] 📡 Announcing presence to network\n")
+    print(f"[DRONE] Announcing presence to network\n")
     send_discovery_beacon()
     
     # Simulate fault detection after 10 seconds
@@ -287,6 +310,6 @@ if __name__ == "__main__":
             # Show known devices
             with device_lock:
                 if known_devices:
-                    print(f"\n[DRONE] 📋 Known devices: {list(known_devices.keys())}")
+                    print(f"\n[DRONE] Known devices: {list(known_devices.keys())}")
     except KeyboardInterrupt:
         print(f"\n[DRONE] Shutting down {DRONE_ID}...")

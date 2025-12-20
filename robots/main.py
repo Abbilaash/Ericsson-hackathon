@@ -1,0 +1,1 @@
+# TODO: robots should inform if its battery is down ensure 
