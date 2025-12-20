@@ -1,83 +1,81 @@
 import socket
 import threading
-import json
 import time
 
-# =========================
-# CONFIG
-# =========================
-NODE_ID = "drone_01"  # Change this for each node (e.g., cobot_01)
-PORT = 5005
-# Using <broadcast> is more portable than 255.255.255.255
-BROADCAST_IP = "255.255.255.255" 
+# Broadcast message to discover peers
+def broadcast_message(broadcast_ip, port):
+    # Create a UDP socket
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_socket.bind(('', 0))  # Bind to any available port
 
-# =========================
-# SOCKET SETUP
-# =========================
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    message = "DISCOVER_PEER"
+    while True:
+        # Send the broadcast message to the local network
+        udp_socket.sendto(message.encode('utf-8'), (broadcast_ip, port))
+        print(f"Broadcasting message: {message}")
+        time.sleep(2)  # Broadcast every 2 seconds
 
-# Allow multiple instances on one machine (useful for testing)
-try:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-except AttributeError:
-    pass # Some systems don't support REUSEPORT
+# Receive incoming messages from peers
+def receive_broadcast_response(port):
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_socket.bind(('', port))
 
-sock.bind(("", PORT))
+    while True:
+        # Listen for responses from peers
+        data, addr = udp_socket.recvfrom(1024)
+        print(f"Received response from {addr[0]}:{addr[1]} - {data.decode('utf-8')}")
 
-# =========================
-# SEND & RECEIVE LOGIC
-# =========================
+# Function to handle the peer-to-peer chat once connected
+def peer_to_peer_chat(peer_ip, peer_port):
+    print(f"Connecting to peer {peer_ip}:{peer_port}...")
 
-def broadcast_message(msg_type, content):
-    """Encapsulates the JSON logic"""
-    message = {
-        "sender_id": NODE_ID,
-        "type": msg_type,
-        "content": content,
-        "timestamp": time.time()
-    }
-    data = json.dumps(message).encode("utf-8")
-    sock.sendto(data, (BROADCAST_IP, PORT))
-    print(f"[SENT] {msg_type}")
+    # Create a TCP socket for direct communication with the peer
+    peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    peer_socket.connect((peer_ip, peer_port))
 
-def listen():
-    print(f"[LISTENING] on UDP port {PORT}...")
+    # Start receiving messages in a separate thread
+    threading.Thread(target=receive_message, args=(peer_socket,)).start()
+
+    # Start sending messages
+    while True:
+        message = input("You: ")
+        peer_socket.send(message.encode('utf-8'))
+        if message.lower() == 'exit':
+            print("Exiting chat...")
+            peer_socket.close()
+            break
+
+# Function to handle receiving messages from peer
+def receive_message(peer_socket):
     while True:
         try:
-            data, addr = sock.recvfrom(4096)
-            message = json.loads(data.decode("utf-8"))
-
-            # Filter own messages
-            if message.get("sender_id") == NODE_ID:
-                continue
-
-            print(f"\n[INCOMING from {message['sender_id']} at {addr}]")
-            print(f"Type: {message['type']} | Content: {message['content']}")
-            
-        except Exception as e:
-            print(f"Error receiving: {e}")
-
-# =========================
-# MAIN EXECUTION
-# =========================
-if __name__ == "__main__":
-    # Start receiver thread
-    listener_thread = threading.Thread(target=listen, daemon=True)
-    listener_thread.start()
-
-    print(f"Node '{NODE_ID}' is active.")
-    
-    try:
-        while True:
-            cmd = input("\nType 'send' to broadcast or 'exit' to quit: ").strip().lower()
-            if cmd == 'send':
-                broadcast_message("TASK_UPDATE", "Drone has identified thermal anomaly at Sector 7")
-            elif cmd == 'exit':
-                break
+            message = peer_socket.recv(1024).decode('utf-8')
+            if message:
+                print(f"\nPeer: {message}")
             else:
-                # Small sleep to prevent high CPU if input() returns immediately
-                time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+                break
+        except:
+            break
+
+def start_chat_system():
+    # Ask user for mode
+    mode = input("Do you want to [S]tart broadcast or [C]onnect to peer? ").strip().lower()
+
+    if mode == 's':
+        # Start broadcasting to find peers
+        broadcast_ip = "255.255.255.255"  # Broadcast to the entire local network
+        port = 12345  # Use an arbitrary port
+        threading.Thread(target=broadcast_message, args=(broadcast_ip, port)).start()
+        threading.Thread(target=receive_broadcast_response, args=(port,)).start()
+    elif mode == 'c':
+        # Wait for user to manually provide peer IP and port
+        peer_ip = input("Enter peer IP address: ")
+        peer_port = int(input("Enter peer port: "))
+        peer_to_peer_chat(peer_ip, peer_port)
+    else:
+        print("Invalid choice! Exiting.")
+
+if __name__ == "__main__":
+    start_chat_system()
