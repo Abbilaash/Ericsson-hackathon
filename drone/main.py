@@ -5,16 +5,13 @@ import socket
 import fxn
 import json
 
-# =========================
-# CONFIG
-# =========================
-
 # TODO: check with the base station for unique drone ID
-
-DRONE_ID = "drone_01"
-ROLE = "drone"
+ROLE = "DRONE"
 DISCOVERY_PORT = 9998
-MESSAGE_PORT = 9999 
+MESSAGE_PORT = 9999
+
+# UNIVERSAL STATUS
+USTATUS = 'IDLE'
 
 def get_local_ip():
     try:
@@ -27,10 +24,11 @@ def get_local_ip():
         return "127.0.0.1"
 
 LOCAL_IP = get_local_ip()
-BATTERY_THRESHOLD = 20.0
+DRONE_ID = f"drone_{LOCAL_IP.replace('.', '')}"
+BATTERY_THRESHOLD = 15.0
 
+print(f"[DRONE] Local IP: {LOCAL_IP}")  
 print(f"[DRONE] Drone ID: {DRONE_ID}")
-print(f"[DRONE] Local IP: {LOCAL_IP}")
 print(f"[DRONE] Discovery Port: {DISCOVERY_PORT}")
 print(f"[DRONE] Message Port: {MESSAGE_PORT}")
 
@@ -42,6 +40,9 @@ known_devices = {}  # {device_id: {"ip": "x.x.x.x", "role": "drone/robot", "last
 tasks = {}
 battery_pct = fxn.get_battery_percentage() or 90.0
 device_lock = threading.Lock()
+handover_ack_received = threading.Event()
+
+HEARTBEAT_INTERVAL_SEC = 60
 
 # =========================
 # NETWORK UTILITIES
@@ -72,6 +73,7 @@ def send_discovery_beacon():
     except Exception as e:
         print(f"[DRONE] Discovery beacon failed: {e}")
 
+
 def send_message_to_device(device_ip, payload):
     """Send message directly to a specific device"""
     try:
@@ -82,6 +84,46 @@ def send_message_to_device(device_ip, payload):
     except Exception as e:
         print(f"[DRONE] Failed to send to {device_ip}: {e}")
 
+def send_join_announcement():
+    """Broadcast a join message to the network/message channel"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        join_msg = json.dumps({
+            "message_type": "JOIN",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "timestamp": now()
+        }).encode('utf-8')
+        sock.sendto(join_msg, ('<broadcast>', MESSAGE_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[DRONE] Join announcement failed: {e}")
+
+
+def send_heartbeat():
+    """Broadcast heartbeat so the base station can track liveness"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        hb = json.dumps({
+            "type": "HEARTBEAT",
+            "message_type": "STATUS",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "status": USTATUS,
+            "battery_pct": battery_pct,
+            "timestamp": now()
+        }).encode('utf-8')
+
+        sock.sendto(hb, ('<broadcast>', MESSAGE_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[DRONE] Heartbeat failed: {e}")
+
 def send_to_network(payload):
     """Send message to all known devices"""
     with device_lock:
@@ -91,52 +133,92 @@ def send_to_network(payload):
         print(f"[DRONE] No devices found in network")
         return
     
-    print(f"[DRONE] 📤 Sending to {len(device_list)} device(s)")
+    print(f"[DRONE] Sending to {len(device_list)} device(s)")
     for device_id, info in device_list:
         send_message_to_device(info["ip"], payload)
+
+
+def is_registered():
+    """Registered once we've discovered at least one peer"""
+    with device_lock:
+        return len(known_devices) > 0
 
 # =========================
 # MESSAGE BUILDERS
 # =========================
 
-# TODO: add location details when sending work_requests
+# Types of work requests:
+# - WORK_REQUEST: reporting a detected fault
+# - DRONE_HANDOVER: requesting battery replacement
+# - DETECTION_CONFIRMATION: asking other drones to confirm a detected fault
+
 
 # TODO: implement object detection
 
+# TODO: write functions for the drone to fly
+
 def build_request(task=None, reason="WORK_REQUEST"):
+    # TODO: add the location details
+    # TODO: for task include the detected problem
     return {
-        "schema_version": "1.0",
         "message_id": gen_message_id(),
         "message_type": "REQUEST",
         "sender_id": DRONE_ID,
-        "sender_role": ROLE,
+        "location": None,
+        "sender_role": "DRONE",
         "sender_ip": LOCAL_IP,
         "timestamp": now(),
-        "receiver_category": ["robot", "drone"],
+        "receiver_category": ["ROBOT"],
         "task": task,
-        "sender_health": {
-            "battery_pct": battery_pct,
-            "power_state": "LOW" if battery_pct < BATTERY_THRESHOLD else "NORMAL"
-        },
+        "request_reason": reason
+    }
+
+def build_drone_work_request_ack(message_id):
+    return {
+        "message_id": gen_message_id(),
+        "message_type": "ACK",
+        "sender_id": DRONE_ID,
+        "sender_role": "DRONE",
+        "sender_ip": LOCAL_IP,
+        "timestamp": now(),
+        "receiver_category": ["DRONE"],
+        "acknowledged_message_id": message_id
+    }
+
+def build_drone_handover_request(task=None, reason="DRONE_HANDOVER"):
+    # TODO: add the location details
+    return {
+        "message_id": gen_message_id(),
+        "message_type": "REQUEST",
+        "sender_id": DRONE_ID,
+        "sender_role": "DRONE",
+        "location": None,
+        "sender_ip": LOCAL_IP,
+        "timestamp": now(),
+        "receiver_category": ["DRONE"],
+        "task": task,
         "request_reason": reason,
         "ttl_sec": 30
     }
 
-def build_drone_handover_request():
+def build_fault_verification_request(task, reason="DETECTION_CONFIRMATION"):
+    '''If one drone wants confirmation from other drones about a detected fault'''
     return {
-        "schema_version": "1.0",
         "message_id": gen_message_id(),
         "message_type": "REQUEST",
         "sender_id": DRONE_ID,
-        "sender_role": ROLE,
+        "sender_role": "DRONE",
         "sender_ip": LOCAL_IP,
         "timestamp": now(),
-        "receiver_category": ["drone"],
-        "request_reason": "DRONE_HANDOVER",
-        "ttl_sec": 30
+        "location":None,
+        "receiver_category": ["DRONE"],
+        "task": task,
+        "request_reason": reason,
+
+        "detected_class":None,
+        "confidence":None
     }
 
-# TODO: ask other drones to verify the fault (when confidence is too low)
 
 def build_ack(task_id, decision):
     return {
@@ -167,29 +249,37 @@ def detect_fault_event():
         "status": "UNCLAIMED"
     }
     tasks[task["task_id"]] = task
-    print(f"\n[DRONE] ⚠️ Fault detected: {task['task_id']}")
+    print(f"\n[DRONE] Fault detected: {task['task_id']}")
     send_to_network(build_request(task=task, reason="WORK_REQUEST"))
 
 def battery_monitor():
-    """Monitor battery and trigger handover when low"""
-    global battery_pct
+    global battery_pct, USTATUS
     while True:
         time.sleep(5)
         battery_pct -= 1.0
         
         if battery_pct < BATTERY_THRESHOLD:
             print(f"\n{'='*60}")
-            print(f"[DRONE] 🔋 CRITICAL: Battery at {battery_pct}%")
+            print(f"[DRONE] CRITICAL: Battery at {battery_pct}%")
             print(f"[DRONE] Requesting handover to all drones")
             print(f"{'='*60}\n")
             
-            send_to_network(build_request(reason="DRONE_HANDOVER"))
+            # Send handover request
+            handover_request = build_drone_handover_request()
+            send_to_network(handover_request)
+            
+            # Wait for ACK from a standby drone
+            print(f"[DRONE] Waiting for ACK from standby drone...")
+            if handover_ack_received.wait(timeout=30):
+                print(f"[DRONE] Handover ACK received. Setting status to IDLE")
+                USTATUS = 'IDLE'
+            else:
+                print(f"[DRONE] No ACK received within timeout")
             break
 
 # =========================
 # LISTENERS
 # =========================
-
 def discovery_listener():
     """Listen for device discovery beacons"""
     try:
@@ -265,6 +355,17 @@ def message_listener():
                 # Handle specific message types
                 if msg_type == "REQUEST" and request_reason == "DRONE_HANDOVER":
                     print(f"[DRONE] 🔋 ALERT: {sender_id} needs battery replacement!\n")
+                    
+                    # If this drone is IDLE, respond with ACK
+                    if USTATUS == 'IDLE':
+                        print(f"[DRONE] This drone is IDLE. Sending ACK to {sender_id}")
+                        ack_msg = build_drone_work_request_ack(msg.get("message_id"))
+                        send_message_to_device(msg.get("sender_ip"), ack_msg)
+                
+                # Handle ACK for handover request
+                if msg_type == "ACK":
+                    print(f"[DRONE] Received ACK from {sender_id}")
+                    handover_ack_received.set()
                 
             except Exception as e:
                 print(f"[DRONE] Error processing message: {e}")
@@ -273,10 +374,18 @@ def message_listener():
         print(f"[DRONE] Message listener failed: {e}")
 
 def periodic_discovery():
-    """Periodically broadcast presence"""
-    while True:
+    """Send limited discovery beacons and periodic heartbeats"""
+
+    # Send exactly 5 discovery signals, 2s apart
+    for idx in range(5):
         send_discovery_beacon()
-        time.sleep(5)  # Send beacon every 5 seconds
+        print(f"[DRONE] Discovery signal {idx+1}/5 sent")
+        time.sleep(2)
+
+    # Steady-state heartbeat for liveness reporting
+    while True:
+        send_heartbeat()
+        time.sleep(HEARTBEAT_INTERVAL_SEC)
 
 # =========================
 # MAIN
@@ -296,14 +405,11 @@ if __name__ == "__main__":
     # Wait for listeners to start
     time.sleep(2)
     
-    # Announce presence
-    print(f"[DRONE] Announcing presence to network\n")
-    send_discovery_beacon()
+    # Presence announcements handled in periodic_discovery (5 signals total)
     
     # Simulate fault detection after 10 seconds
-    threading.Timer(10, detect_fault_event).start()
+    # threading.Timer(10, detect_fault_event).start()
     
-    # Keep main thread alive
     try:
         while True:
             time.sleep(10)

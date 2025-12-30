@@ -5,3 +5,4 @@ def get_battery_percentage():
     if battery is None:
         return None
     return battery.percent
+
