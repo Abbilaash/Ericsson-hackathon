@@ -25,23 +25,6 @@ LOCAL_IP = get_local_ip()
 DRONE_ID = f"drone_{LOCAL_IP.replace('.', '')}"
 BATTERY_THRESHOLD = 15.0
 
-
-def get_broadcast_targets(port):
-    """Return a list of broadcast addresses to increase reach across subnets."""
-    targets = [("255.255.255.255", port)]
-    try:
-        parts = LOCAL_IP.split('.')
-        if len(parts) == 4:
-            subnet_broadcast = '.'.join(parts[:3] + ['255'])
-            if subnet_broadcast != "255.255.255.255":
-                targets.append((subnet_broadcast, port))
-    except Exception:
-        pass
-    return targets
-
-
-BROADCAST_TARGETS = get_broadcast_targets(MESSAGE_PORT)
-
 print(f"[DRONE] Local IP: {LOCAL_IP}")  
 print(f"[DRONE] Drone ID: {DRONE_ID}")
 print(f"[DRONE] Message Port: {MESSAGE_PORT}")
@@ -56,6 +39,10 @@ DISCOVERY_PORT = 9998  # Port for discovery broadcasts
 base_station_ip = None  # Base station IP (received from ACK)
 base_station_lock = threading.Lock()  # Lock for base_station_ip
 HEARTBEAT_INTERVAL_SEC = 60  # Send heartbeat every 60 seconds
+
+# Known peer IPs (populated from base station or observed senders)
+peer_ips = set()
+peer_lock = threading.Lock()
 
 # Position tracking (will be updated when drone flies)
 drone_position = {
@@ -78,11 +65,59 @@ handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
 def now():
     return time.time()
 
+
+def update_peers(ip_list):
+    """Add provided IPs to peer set, skipping our own."""
+    if not ip_list:
+        return
+    with peer_lock:
+        for ip in ip_list:
+            if ip and ip != LOCAL_IP:
+                peer_ips.add(ip)
+
+
+def get_targets(include_requester_ip=None):
+    """Collect target IPs for direct UDP sends (peers + base station + optional requester)."""
+    targets = set()
+    if include_requester_ip and include_requester_ip != LOCAL_IP:
+        targets.add(include_requester_ip)
+    with base_station_lock:
+        if base_station_ip and base_station_ip != LOCAL_IP:
+            targets.add(base_station_ip)
+    with peer_lock:
+        for ip in peer_ips:
+            if ip != LOCAL_IP:
+                targets.add(ip)
+    return [(ip, MESSAGE_PORT) for ip in targets]
+
+
+def request_peer_list():
+    """Ask base station for latest peer IP list."""
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        msg = json.dumps({
+            "message_type": "PEER_LIST_REQUEST",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "timestamp": now()
+        }).encode('utf-8')
+        sock.sendto(msg, (bs_ip, MESSAGE_PORT))
+        sock.close()
+        print(f"[DRONE] 📡 Requested peer list from base station {bs_ip}")
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to request peer list: {e}")
+        return False
+
 def send_discovery_broadcast():
     """Broadcast discovery message to join the network"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
         discovery_msg = json.dumps({
             "type": "DISCOVERY",
@@ -146,7 +181,6 @@ def broadcast_replacement_request():
     
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
         # Get current position
         with position_lock:
@@ -175,8 +209,10 @@ def broadcast_replacement_request():
             "timestamp": now()
         }).encode('utf-8')
 
-        # Broadcast to ALL nodes in the network (global and subnet broadcast)
-        for target in BROADCAST_TARGETS:
+        targets = get_targets()
+        if not targets:
+            print(f"[DRONE] ⚠️ No peers known; cannot send replacement request")
+        for target in targets:
             try:
                 sock.sendto(replacement_msg, target)
             except Exception as inner_err:
@@ -184,14 +220,14 @@ def broadcast_replacement_request():
         sock.close()
         
         print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 HANDOVER MESSAGE BROADCAST TO ALL NODES")
+        print(f"[DRONE] 📡 HANDOVER MESSAGE SENT TO KNOWN NODES")
         print(f"[DRONE] Message ID: {message_id}")
         print(f"[DRONE] Status: {USTATUS} (IDLE/ACTIVE status of requesting drone)")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
-        print(f"[DRONE] Broadcasted to: All drones, robots, and base station on network")
-        print(f"[DRONE] Protocol: UDP Broadcast (no specific IP address)")
+        print(f"[DRONE] Targets: {targets if targets else 'none (no peers known)'}")
+        print(f"[DRONE] Protocol: UDP Unicast to each target")
         print(f"{'='*60}\n")
         
         return True
@@ -215,7 +251,6 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
     """Broadcast issue detection with location and issue type (works for both simulation and real detection)"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         # Get current position
         with position_lock:
@@ -242,7 +277,10 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
             "timestamp": now()
         }).encode('utf-8')
 
-        for target in BROADCAST_TARGETS:
+        targets = get_targets()
+        if not targets:
+            print(f"[DRONE] ⚠️ No peers known; cannot send issue detection")
+        for target in targets:
             try:
                 sock.sendto(detection_msg, target)
             except Exception as inner_err:
@@ -251,10 +289,12 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
         
         sim_text = " (SIMULATION)" if is_simulation else ""
         print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 ISSUE DETECTION BROADCAST SENT{sim_text}")
+        print(f"[DRONE] 📡 ISSUE DETECTION SENT{sim_text}")
         print(f"[DRONE] Issue Type: {issue_type}")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
+        print(f"[DRONE] Targets: {targets if targets else 'none (no peers known)'}")
+        print(f"[DRONE] Protocol: UDP Unicast to each target")
         print(f"{'='*60}\n")
         
         return True
@@ -430,7 +470,7 @@ def handle_battery_low_simulation():
     handle_battery_low()
 
 def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id):
-    """Broadcast handover response ACK to all drones (not just requesting drone)"""
+    """Send handover response ACK directly to requester, base, and known peers."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -449,8 +489,10 @@ def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
             "timestamp": now()
         }).encode('utf-8')
         
-        # Broadcast to all drones (not just the requesting drone)
-        for target in BROADCAST_TARGETS:
+        targets = get_targets(include_requester_ip=requesting_drone_ip)
+        if not targets:
+            print(f"[DRONE] ⚠️ No peers known; cannot send handover ACK")
+        for target in targets:
             try:
                 sock.sendto(response_msg, target)
             except Exception as inner_err:
@@ -501,6 +543,9 @@ def udp_message_listener():
                 sender_id = msg.get("sender_id")
                 sender_ip = msg.get("sender_ip") or addr[0]
 
+                # Learn peers from any incoming message
+                update_peers([sender_ip])
+
                 # Ignore our own broadcasts to avoid double-printing and feedback
                 if sender_id == DRONE_ID or sender_ip == LOCAL_IP:
                     continue
@@ -523,6 +568,8 @@ def udp_message_listener():
                         with base_station_lock:
                             global base_station_ip
                             base_station_ip = bs_ip
+                        # Optional peer list provided by base station
+                        update_peers(msg.get("peer_ips"))
                         print(f"\n{'='*60}")
                         print(f"[DRONE] ✅ RECEIVED BASE STATION ACK")
                         print(f"[DRONE] From: {addr[0]}:{addr[1]}")
@@ -531,6 +578,13 @@ def udp_message_listener():
                         print(f"[DRONE] Status: Connected to network")
                         print(f"[DRONE] Starting heartbeat sender (every {HEARTBEAT_INTERVAL_SEC} seconds)")
                         print(f"{'='*60}\n")
+                        # Request explicit peer list after connecting
+                        request_peer_list()
+
+                elif msg_type == "PEER_LIST":
+                    peer_list = msg.get("peer_ips") or msg.get("peers")
+                    update_peers(peer_list)
+                    print(f"[DRONE] ✅ Updated peer list from base station: {peer_list}")
                 
                 elif msg_type == "BATTERY_LOW_SIMULATION":
                     target_id = msg.get("target_device_id")
