@@ -9,7 +9,7 @@ ROLE = "DRONE"
 MESSAGE_PORT = 9999
 
 # UNIVERSAL STATUS
-USTATUS = 'IDLE'
+USTATUS = 'ACTIVE'
 
 def get_local_ip():
     try:
@@ -120,12 +120,10 @@ def heartbeat_sender():
         send_heartbeat()
 
 def broadcast_replacement_request():
-    """Broadcast replacement request to ALL nodes in the network (drones, robots, base station) via UDP"""
     global replacement_broadcast_sent
     
     with replacement_lock:
         if replacement_broadcast_sent:
-            # Already sent, don't send again
             return
         replacement_broadcast_sent = True
     
@@ -167,6 +165,7 @@ def broadcast_replacement_request():
         print(f"\n{'='*60}")
         print(f"[DRONE] 📡 HANDOVER MESSAGE BROADCAST TO ALL NODES")
         print(f"[DRONE] Message ID: {message_id}")
+        print(f"[DRONE] Status: {USTATUS} (IDLE/ACTIVE status of requesting drone)")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
@@ -209,6 +208,8 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
             "sender_ip": LOCAL_IP,
             "issue_type": issue_type,
             "is_simulation": is_simulation,
+            # Explicit receiver category so drones know they should log the alert
+            "receiver_category": "DRONE",
             "location": {
                 "x": pos["x"],
                 "y": pos["y"],
@@ -356,7 +357,7 @@ def stop_flight():
 
 def handle_battery_low():
     global battery_pct, USTATUS
-    
+        
     if battery_pct < BATTERY_THRESHOLD:
         print(f"\n{'='*60}")
         print(f"[DRONE] CRITICAL: Battery at {battery_pct}%")
@@ -364,14 +365,12 @@ def handle_battery_low():
         print(f"[DRONE] Status changed to BATTERY_LOW")
         print(f"{'='*60}\n")
         USTATUS = 'BATTERY_LOW'
-        
-        # Broadcast replacement request to all devices via UDP
         broadcast_replacement_request()
 
 def battery_monitor():
     """Periodically monitor battery level and trigger low battery handling"""
     global battery_pct
-    
+        
     while True:
         try:
             # Update battery level from sensor
@@ -452,15 +451,23 @@ def udp_message_listener():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Enable broadcast reception (though not always required, helps on some systems)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind(("", MESSAGE_PORT))
         print(f"[DRONE] 📡 UDP message listener started on port {MESSAGE_PORT}")
+        print(f"[DRONE]    Listening for broadcast messages on all interfaces")
+        print(f"[DRONE]    Buffer size: 4096 bytes (max message size)")
         
         while True:
             try:
-                data, addr = sock.recvfrom(4096)
+                # 4096 is the buffer size - maximum bytes to receive in one UDP packet
+                # This is sufficient for JSON messages (typically < 1KB)
+                # If messages are larger, increase this value (e.g., 8192, 16384)
+                data, addr = sock.recvfrom(8192)
                 msg = json.loads(data.decode('utf-8'))
                 msg_type = msg.get("message_type")
                 msg_class = msg.get("message_class", "UNKNOWN")
+                print(msg_class)
                 sender_role = msg.get("sender_role", "").upper()
                 
                 # Print all received broadcast messages
@@ -529,7 +536,7 @@ def udp_message_listener():
                         elif command == "GROUND":
                             stop_flight()
                 
-                elif msg_class == "REPLACEMENT_REQUEST" and msg.get("receiver_category", "").upper() == "DRONE":
+                elif msg_class == "REPLACEMENT_REQUEST" and msg['receiver_category'].upper() == "DRONE":
                     # A message is considered DRONE_HANDOVER if message_class is REPLACEMENT_REQUEST and receiver_category is DRONE
                     requesting_drone_id = msg.get("sender_id")
                     requesting_drone_ip = msg.get("sender_ip") or addr[0]
@@ -537,16 +544,18 @@ def udp_message_listener():
                     receiver_category = msg.get("receiver_category", "").upper()
                     
                     # Print the request details
+                    requesting_status = msg.get('status', 'UNKNOWN')
                     print(f"\n{'='*60}")
                     print(f"[DRONE] 📨 RECEIVED HANDOVER REQUEST")
                     print(f"[DRONE] Message ID: {message_id}")
                     print(f"[DRONE] From: {requesting_drone_id} at {requesting_drone_ip}")
+                    print(f"[DRONE] Requesting Drone Status: {requesting_status} (IDLE/ACTIVE)")
                     print(f"[DRONE] Reason: {msg.get('request_reason', 'UNKNOWN')}")
                     print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}%")
                     location = msg.get('location', {})
                     if location:
                         print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
-                    print(f"[DRONE] Current Status: {USTATUS}")
+                    print(f"[DRONE] Current Status (This Drone): {USTATUS}")
                     print(f"{'='*60}\n")
                     
                     # Check if this message_id has already been acknowledged
@@ -567,6 +576,23 @@ def udp_message_listener():
                         print(f"[DRONE] ⚠️  Status is {USTATUS}, not IDLE - Not responding\n")
                     elif already_acknowledged:
                         print(f"[DRONE] ⚠️  Message ID {message_id} already acknowledged - Not responding\n")
+
+                elif msg_type == "ISSUE_DETECTION":
+                    receiver_category = msg.get("receiver_category", "").upper()
+                    # Only log when broadcast is intended for drones
+                    if "DRONE" in receiver_category or receiver_category == "":
+                        issue = msg.get("issue_type", "UNKNOWN")
+                        location = msg.get("location", {})
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] ⚠️ ISSUE DETECTION RECEIVED")
+                        print(f"[DRONE] Issue: {issue}")
+                        if location:
+                            print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                            print(f"[DRONE] Yaw: {location.get('yaw', 0):.4f} rad")
+                        print(f"[DRONE] From: {msg.get('sender_id', 'UNKNOWN')} at {addr[0]}")
+                        print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}% | Status: {msg.get('status', 'UNKNOWN')}")
+                        print(f"[DRONE] Receiver Category: {receiver_category or 'DRONE (default)'}")
+                        print(f"{'='*60}\n")
                 
                 elif msg_type == "DRONE_HANDOVER_ACK" and sender_role == "DRONE":
                     # Response to a handover request (could be ours or another drone's)
@@ -596,11 +622,18 @@ def udp_message_listener():
                         print(f"[DRONE]    Responder: {responder_drone_id} at {responder_ip}")
                         print(f"[DRONE]    This message_id is now marked as acknowledged\n")
                 
+            except json.JSONDecodeError as e:
+                print(f"[DRONE] ⚠️  Error decoding JSON message from {addr}: {e}")
+                print(f"[DRONE]    Raw data (first 100 bytes): {data[:100] if len(data) > 0 else 'EMPTY'}")
             except Exception as e:
-                print(f"[DRONE] Error processing message: {e}")
+                print(f"[DRONE] ⚠️  Error processing message from {addr}: {e}")
+                import traceback
+                traceback.print_exc()
                 
     except Exception as e:
-        print(f"[DRONE] UDP message listener failed: {e}")
+        print(f"[DRONE] ❌ UDP message listener failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 # =========================
 # MAIN
