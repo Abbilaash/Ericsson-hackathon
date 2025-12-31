@@ -119,55 +119,6 @@ def heartbeat_sender():
         time.sleep(HEARTBEAT_INTERVAL_SEC)
         send_heartbeat()
 
-def get_device_ips_from_base_station():
-    """Request list of all device IPs from base station"""
-    with base_station_lock:
-        bs_ip = base_station_ip
-    
-    if bs_ip is None:
-        print(f"[DRONE] Cannot get device IPs - base station IP not known")
-        return []
-    
-    try:
-        # Create socket for request/response
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(5.0)  # 5 second timeout for response
-        sock.bind(('', 0))  # Bind to any available port
-        
-        request_msg = json.dumps({
-            "message_type": "DEVICE_LIST_REQUEST",
-            "sender_id": DRONE_ID,
-            "sender_role": ROLE,
-            "sender_ip": LOCAL_IP,
-            "timestamp": now()
-        }).encode('utf-8')
-        
-        sock.sendto(request_msg, (bs_ip, MESSAGE_PORT))
-        print(f"[DRONE] 📨 Requested device list from base station at {bs_ip}")
-        
-        # Wait for response
-        data, addr = sock.recvfrom(8192)
-        response = json.loads(data.decode('utf-8'))
-        
-        if response.get("message_type") == "DEVICE_LIST_RESPONSE":
-            devices = response.get("devices", [])
-            # Filter out our own IP
-            device_ips = [d.get("ip") for d in devices if d.get("ip") and d.get("ip") != LOCAL_IP]
-            print(f"[DRONE] ✅ Received {len(device_ips)} device IPs from base station")
-            sock.close()
-            return device_ips
-        else:
-            print(f"[DRONE] ⚠️  Unexpected response type: {response.get('message_type')}")
-            sock.close()
-            return []
-            
-    except socket.timeout:
-        print(f"[DRONE] ⚠️  Timeout waiting for device list from base station")
-        return []
-    except Exception as e:
-        print(f"[DRONE] Failed to get device IPs: {e}")
-        return []
-
 def broadcast_replacement_request():
     global replacement_broadcast_sent
     
@@ -176,16 +127,17 @@ def broadcast_replacement_request():
             return
         replacement_broadcast_sent = True
     
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send replacement request - base station IP unknown")
+        with replacement_lock:
+            replacement_broadcast_sent = False
+        return False
+    
     try:
-        # Get list of device IPs from base station
-        device_ips = get_device_ips_from_base_station()
-        
-        if not device_ips:
-            print(f"[DRONE] ⚠️  No device IPs available - cannot send replacement request")
-            with replacement_lock:
-                replacement_broadcast_sent = False
-            return False
-        
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
         # Get current position
@@ -211,33 +163,28 @@ def broadcast_replacement_request():
                 "z": pos["z"],
                 "yaw": pos["yaw"]
             },
-            "receiver_category": "DRONE",
+            "receiver_category": "DRONE",  # Only drones should respond
             "timestamp": now()
         }).encode('utf-8')
 
-        # Send to each device IP directly (unicast)
-        sent_count = 0
-        for device_ip in device_ips:
-            try:
-                sock.sendto(replacement_msg, (device_ip, MESSAGE_PORT))
-                sent_count += 1
-            except Exception as inner_err:
-                print(f"[DRONE] Failed to send replacement to {device_ip}: {inner_err}")
+        # Send to base station (will relay to all devices)
+        sock.sendto(replacement_msg, (bs_ip, MESSAGE_PORT))
         sock.close()
         
         print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 HANDOVER REQUEST SENT TO {sent_count} DEVICES")
+        print(f"[DRONE] 📡 HANDOVER REQUEST SENT TO BASE STATION")
         print(f"[DRONE] Message ID: {message_id}")
-        print(f"[DRONE] Status: {USTATUS}")
+        print(f"[DRONE] Status: {USTATUS} (IDLE/ACTIVE status of requesting drone)")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
-        print(f"[DRONE] Sent to: {sent_count} device(s) via UDP unicast")
+        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+        print(f"[DRONE] Base station will relay to all drones")
         print(f"{'='*60}\n")
         
         return True
     except Exception as e:
-        print(f"[DRONE] Failed to send replacement request: {e}")
+        print(f"[DRONE] Failed to broadcast replacement request: {e}")
         with replacement_lock:
             replacement_broadcast_sent = False  # Reset on failure
         return False
@@ -253,15 +200,16 @@ def update_position(x, y, z, yaw=None):
             drone_position["yaw"] = yaw
 
 def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
-    """Send issue detection to all devices via unicast"""
+    """Send issue detection to base station (will relay to all devices)"""
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send issue detection - base station IP unknown")
+        return False
+    
     try:
-        # Get list of device IPs from base station
-        device_ips = get_device_ips_from_base_station()
-        
-        if not device_ips:
-            print(f"[DRONE] ⚠️  No device IPs available - cannot send issue detection")
-            return False
-        
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         # Get current position
@@ -288,28 +236,23 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
             "timestamp": now()
         }).encode('utf-8')
 
-        # Send to each device IP directly (unicast)
-        sent_count = 0
-        for device_ip in device_ips:
-            try:
-                sock.sendto(detection_msg, (device_ip, MESSAGE_PORT))
-                sent_count += 1
-            except Exception as inner_err:
-                print(f"[DRONE] Failed to send issue detection to {device_ip}: {inner_err}")
+        # Send to base station (will relay to all devices)
+        sock.sendto(detection_msg, (bs_ip, MESSAGE_PORT))
         sock.close()
         
         sim_text = " (SIMULATION)" if is_simulation else ""
         print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 ISSUE DETECTION SENT{sim_text}")
+        print(f"[DRONE] 📡 ISSUE DETECTION SENT TO BASE STATION{sim_text}")
         print(f"[DRONE] Issue Type: {issue_type}")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
-        print(f"[DRONE] Sent to: {sent_count} device(s) via UDP unicast")
+        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+        print(f"[DRONE] Base station will relay to all drones")
         print(f"{'='*60}\n")
         
         return True
     except Exception as e:
-        print(f"[DRONE] Failed to send issue detection: {e}")
+        print(f"[DRONE] Failed to broadcast issue detection: {e}")
         return False
 
 def calculate_3d_spiral_step(tower_pos, radius, current_theta, vertical_speed):
@@ -480,15 +423,16 @@ def handle_battery_low_simulation():
     handle_battery_low()
 
 def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id):
-    """Send handover response ACK to all devices via unicast"""
+    """Send handover response ACK to base station (will relay to all drones)"""
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send handover ACK - base station IP unknown")
+        return False
+    
     try:
-        # Get list of device IPs from base station
-        device_ips = get_device_ips_from_base_station()
-        
-        if not device_ips:
-            print(f"[DRONE] ⚠️  No device IPs available - sending only to requesting drone")
-            device_ips = [requesting_drone_ip]  # At minimum, send to the requesting drone
-        
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
         response_msg = json.dumps({
@@ -505,14 +449,8 @@ def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
             "timestamp": now()
         }).encode('utf-8')
         
-        # Send to each device IP directly (unicast)
-        sent_count = 0
-        for device_ip in device_ips:
-            try:
-                sock.sendto(response_msg, (device_ip, MESSAGE_PORT))
-                sent_count += 1
-            except Exception as inner_err:
-                print(f"[DRONE] Failed to send handover ACK to {device_ip}: {inner_err}")
+        # Send to base station (will relay to all drones)
+        sock.sendto(response_msg, (bs_ip, MESSAGE_PORT))
         sock.close()
         
         # Mark this message_id as acknowledged so we don't respond again
@@ -520,12 +458,13 @@ def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
             acknowledged_handover_ids.add(message_id)
         
         print(f"\n{'='*60}")
-        print(f"[DRONE] ✅ HANDOVER RESPONSE ACK SENT")
+        print(f"[DRONE] ✅ HANDOVER ACK SENT TO BASE STATION")
         print(f"[DRONE] Message ID: {message_id}")
         print(f"[DRONE] For Request From: {requesting_drone_id} at {requesting_drone_ip}")
         print(f"[DRONE] Responder IP: {LOCAL_IP}")
         print(f"[DRONE] Status: {USTATUS}")
-        print(f"[DRONE] Sent to: {sent_count} device(s) via UDP unicast")
+        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+        print(f"[DRONE] Base station will relay to all drones")
         print(f"{'='*60}\n")
         
         return True
@@ -554,18 +493,16 @@ def udp_message_listener():
                 msg = json.loads(data.decode('utf-8'))
                 msg_type = msg.get("message_type")
                 msg_class = msg.get("message_class", "UNKNOWN")
-                print(msg_class)
                 sender_role = msg.get("sender_role", "").upper()
                 sender_id = msg.get("sender_id")
-                sender_ip = msg.get("sender_ip") or addr[0]
-
-                # Ignore our own broadcasts to avoid double-printing and feedback
-                if sender_id == DRONE_ID or sender_ip == LOCAL_IP:
+                
+                # Ignore messages from ourselves
+                if sender_id == DRONE_ID:
                     continue
                 
-                # Print all received broadcast messages
+                # Print all received messages (relayed from base station)
                 print(f"\n{'='*60}")
-                print(f"[DRONE] 📨 RECEIVED BROADCAST MESSAGE")
+                print(f"[DRONE] 📨 RECEIVED MESSAGE (via Base Station)")
                 print(f"[DRONE] From: {addr[0]}:{addr[1]}")
                 print(f"[DRONE] Message Type: {msg_type}")
                 print(f"[DRONE] Message Class: {msg_class}")
