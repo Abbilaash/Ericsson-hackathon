@@ -2,3 +2,9 @@ flask
 flask-cors
 requests
 psutil
+opencv-python
+inference-sdk
+numpy
+pymavlink
+pyserial
+stm32loader
