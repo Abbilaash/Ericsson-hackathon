@@ -25,6 +25,23 @@ LOCAL_IP = get_local_ip()
 DRONE_ID = f"drone_{LOCAL_IP.replace('.', '')}"
 BATTERY_THRESHOLD = 15.0
 
+
+def get_broadcast_targets(port):
+    """Return a list of broadcast addresses to increase reach across subnets."""
+    targets = [("255.255.255.255", port)]
+    try:
+        parts = LOCAL_IP.split('.')
+        if len(parts) == 4:
+            subnet_broadcast = '.'.join(parts[:3] + ['255'])
+            if subnet_broadcast != "255.255.255.255":
+                targets.append((subnet_broadcast, port))
+    except Exception:
+        pass
+    return targets
+
+
+BROADCAST_TARGETS = get_broadcast_targets(MESSAGE_PORT)
+
 print(f"[DRONE] Local IP: {LOCAL_IP}")  
 print(f"[DRONE] Drone ID: {DRONE_ID}")
 print(f"[DRONE] Message Port: {MESSAGE_PORT}")
@@ -157,9 +174,13 @@ def broadcast_replacement_request():
             "receiver_category": "DRONE",  # Only drones should respond, but message goes to all nodes
             "timestamp": now()
         }).encode('utf-8')
-        
-        # Broadcast to ALL nodes in the network (same pattern as discovery broadcast)
-        sock.sendto(replacement_msg, ('<broadcast>', MESSAGE_PORT))
+
+        # Broadcast to ALL nodes in the network (global and subnet broadcast)
+        for target in BROADCAST_TARGETS:
+            try:
+                sock.sendto(replacement_msg, target)
+            except Exception as inner_err:
+                print(f"[DRONE] Failed to send replacement to {target}: {inner_err}")
         sock.close()
         
         print(f"\n{'='*60}")
@@ -221,7 +242,11 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
             "timestamp": now()
         }).encode('utf-8')
 
-        sock.sendto(detection_msg, ('<broadcast>', MESSAGE_PORT))
+        for target in BROADCAST_TARGETS:
+            try:
+                sock.sendto(detection_msg, target)
+            except Exception as inner_err:
+                print(f"[DRONE] Failed to send issue detection to {target}: {inner_err}")
         sock.close()
         
         sim_text = " (SIMULATION)" if is_simulation else ""
@@ -425,7 +450,11 @@ def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
         }).encode('utf-8')
         
         # Broadcast to all drones (not just the requesting drone)
-        sock.sendto(response_msg, ('<broadcast>', MESSAGE_PORT))
+        for target in BROADCAST_TARGETS:
+            try:
+                sock.sendto(response_msg, target)
+            except Exception as inner_err:
+                print(f"[DRONE] Failed to send handover ACK to {target}: {inner_err}")
         sock.close()
         
         # Mark this message_id as acknowledged so we don't respond again
@@ -469,6 +498,12 @@ def udp_message_listener():
                 msg_class = msg.get("message_class", "UNKNOWN")
                 print(msg_class)
                 sender_role = msg.get("sender_role", "").upper()
+                sender_id = msg.get("sender_id")
+                sender_ip = msg.get("sender_ip") or addr[0]
+
+                # Ignore our own broadcasts to avoid double-printing and feedback
+                if sender_id == DRONE_ID or sender_ip == LOCAL_IP:
+                    continue
                 
                 # Print all received broadcast messages
                 print(f"\n{'='*60}")
@@ -477,7 +512,7 @@ def udp_message_listener():
                 print(f"[DRONE] Message Type: {msg_type}")
                 print(f"[DRONE] Message Class: {msg_class}")
                 print(f"[DRONE] Sender Role: {sender_role}")
-                print(f"[DRONE] Sender ID: {msg.get('sender_id', 'UNKNOWN')}")
+                print(f"[DRONE] Sender ID: {sender_id or 'UNKNOWN'}")
                 print(f"[DRONE] Full Message:")
                 print(json.dumps(msg, indent=2))
                 print(f"{'='*60}\n")
