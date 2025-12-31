@@ -119,14 +119,6 @@ def heartbeat_sender():
         time.sleep(HEARTBEAT_INTERVAL_SEC)
         send_heartbeat()
 
-def get_network_broadcast_address():
-    """Get the network broadcast address for UDP broadcast"""
-    try:
-        # Use 255.255.255.255 for full network broadcast (all devices on network)
-        return "255.255.255.255"
-    except Exception:
-        return "255.255.255.255"
-
 def broadcast_replacement_request():
     """Broadcast replacement request to ALL nodes in the network (drones, robots, base station) via UDP"""
     global replacement_broadcast_sent
@@ -168,14 +160,12 @@ def broadcast_replacement_request():
             "timestamp": now()
         }).encode('utf-8')
         
-        # Broadcast to ALL nodes in the network using UDP broadcast address
-        broadcast_addr = get_network_broadcast_address()
-        sock.sendto(replacement_msg, (broadcast_addr, MESSAGE_PORT))
+        # Broadcast to ALL nodes in the network (same pattern as discovery broadcast)
+        sock.sendto(replacement_msg, ('<broadcast>', MESSAGE_PORT))
         sock.close()
         
         print(f"\n{'='*60}")
         print(f"[DRONE] 📡 HANDOVER MESSAGE BROADCAST TO ALL NODES")
-        print(f"[DRONE] Broadcast Address: {broadcast_addr}:{MESSAGE_PORT}")
         print(f"[DRONE] Message ID: {message_id}")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
@@ -365,7 +355,6 @@ def stop_flight():
 # =========================
 
 def handle_battery_low():
-    """Handle battery low condition - broadcast replacement request"""
     global battery_pct, USTATUS
     
     if battery_pct < BATTERY_THRESHOLD:
@@ -474,6 +463,18 @@ def udp_message_listener():
                 msg_class = msg.get("message_class", "UNKNOWN")
                 sender_role = msg.get("sender_role", "").upper()
                 
+                # Print all received broadcast messages
+                print(f"\n{'='*60}")
+                print(f"[DRONE] 📨 RECEIVED BROADCAST MESSAGE")
+                print(f"[DRONE] From: {addr[0]}:{addr[1]}")
+                print(f"[DRONE] Message Type: {msg_type}")
+                print(f"[DRONE] Message Class: {msg_class}")
+                print(f"[DRONE] Sender Role: {sender_role}")
+                print(f"[DRONE] Sender ID: {msg.get('sender_id', 'UNKNOWN')}")
+                print(f"[DRONE] Full Message:")
+                print(json.dumps(msg, indent=2))
+                print(f"{'='*60}\n")
+                
                 if msg_type == "BASE_STATION_ACK":
                     bs_ip = msg.get("base_station_ip")
                     if bs_ip:
@@ -528,8 +529,8 @@ def udp_message_listener():
                         elif command == "GROUND":
                             stop_flight()
                 
-                elif msg_type == "DRONE_HANDOVER" and sender_role == "DRONE":
-                    # Another drone is requesting handover/replacement
+                elif msg_class == "REPLACEMENT_REQUEST" and msg.get("receiver_category", "").upper() == "DRONE":
+                    # A message is considered DRONE_HANDOVER if message_class is REPLACEMENT_REQUEST and receiver_category is DRONE
                     requesting_drone_id = msg.get("sender_id")
                     requesting_drone_ip = msg.get("sender_ip") or addr[0]
                     message_id = msg.get("message_id")  # Get the message_id from the request
