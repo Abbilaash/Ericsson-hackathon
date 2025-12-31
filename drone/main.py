@@ -119,8 +119,16 @@ def heartbeat_sender():
         time.sleep(HEARTBEAT_INTERVAL_SEC)
         send_heartbeat()
 
+def get_network_broadcast_address():
+    """Get the network broadcast address for UDP broadcast"""
+    try:
+        # Use 255.255.255.255 for full network broadcast (all devices on network)
+        return "255.255.255.255"
+    except Exception:
+        return "255.255.255.255"
+
 def broadcast_replacement_request():
-    """Broadcast replacement request to all drones when battery is low"""
+    """Broadcast replacement request to ALL nodes in the network (drones, robots, base station) via UDP"""
     global replacement_broadcast_sent
     
     with replacement_lock:
@@ -156,20 +164,24 @@ def broadcast_replacement_request():
                 "z": pos["z"],
                 "yaw": pos["yaw"]
             },
-            "receiver_category": "DRONE",  # Only drones should respond
+            "receiver_category": "DRONE",  # Only drones should respond, but message goes to all nodes
             "timestamp": now()
         }).encode('utf-8')
         
-        sock.sendto(replacement_msg, ('<broadcast>', MESSAGE_PORT))
+        # Broadcast to ALL nodes in the network using UDP broadcast address
+        broadcast_addr = get_network_broadcast_address()
+        sock.sendto(replacement_msg, (broadcast_addr, MESSAGE_PORT))
         sock.close()
         
         print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 REPLACEMENT REQUEST BROADCAST SENT")
+        print(f"[DRONE] 📡 HANDOVER MESSAGE BROADCAST TO ALL NODES")
+        print(f"[DRONE] Broadcast Address: {broadcast_addr}:{MESSAGE_PORT}")
         print(f"[DRONE] Message ID: {message_id}")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
-        print(f"[DRONE] Requesting replacement from available drones")
+        print(f"[DRONE] Broadcasted to: All drones, robots, and base station on network")
+        print(f"[DRONE] Protocol: UDP Broadcast (no specific IP address)")
         print(f"{'='*60}\n")
         
         return True
