@@ -359,13 +359,35 @@ def handle_battery_low():
     if battery_pct < BATTERY_THRESHOLD:
         print(f"\n{'='*60}")
         print(f"[DRONE] CRITICAL: Battery at {battery_pct}%")
-        print(f"[DRONE] Battery low threshold reached")
+        print(f"[DRONE] Battery low threshold reached ({BATTERY_THRESHOLD}%)")
         print(f"[DRONE] Status changed to BATTERY_LOW")
         print(f"{'='*60}\n")
         USTATUS = 'BATTERY_LOW'
         
-        # Broadcast replacement request
+        # Broadcast replacement request to all devices via UDP
         broadcast_replacement_request()
+
+def battery_monitor():
+    """Periodically monitor battery level and trigger low battery handling"""
+    global battery_pct
+    
+    while True:
+        try:
+            # Update battery level from sensor
+            new_battery = fxn.get_battery_percentage()
+            if new_battery is not None:
+                battery_pct = new_battery
+            
+            # Check if battery is low
+            if battery_pct < BATTERY_THRESHOLD and USTATUS != 'BATTERY_LOW':
+                # Battery just dropped below threshold - handle it
+                handle_battery_low()
+            
+            # Check battery every 10 seconds
+            time.sleep(10)
+        except Exception as e:
+            print(f"[DRONE] Battery monitor error: {e}")
+            time.sleep(10)
 
 def handle_battery_low_simulation():
     """Handle battery low simulation - set battery to 14.0% and trigger low battery functions"""
@@ -583,6 +605,9 @@ if __name__ == "__main__":
     
     # Start heartbeat sender thread
     threading.Thread(target=heartbeat_sender, daemon=True).start()
+    
+    # Start battery monitor thread (automatically checks battery and broadcasts replacement when low)
+    threading.Thread(target=battery_monitor, daemon=True).start()
     
     # Wait for listener to start
     time.sleep(1)
