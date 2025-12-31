@@ -50,6 +50,9 @@ drone_position = {
 position_lock = threading.Lock()  # Lock for position updates
 replacement_broadcast_sent = False  # Track if replacement request already sent
 replacement_lock = threading.Lock()  # Lock for replacement flag
+# Track acknowledged handover message IDs (so drones don't respond to already-acknowledged requests)
+acknowledged_handover_ids = set()  # Set of message_ids that have been acknowledged
+handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
 
 # =========================
 # NETWORK UTILITIES
@@ -134,9 +137,13 @@ def broadcast_replacement_request():
         with position_lock:
             pos = drone_position.copy()
         
+        # Generate unique message_id for this handover request
+        message_id = f"{DRONE_ID}_{int(now() * 1000)}"  # Unique ID: drone_id + timestamp
+        
         replacement_msg = json.dumps({
             "message_type": "DRONE_HANDOVER",
             "message_class": "REPLACEMENT_REQUEST",
+            "message_id": message_id,  # Unique ID for this request
             "sender_id": DRONE_ID,
             "sender_role": ROLE,
             "sender_ip": LOCAL_IP,
@@ -158,6 +165,7 @@ def broadcast_replacement_request():
         
         print(f"\n{'='*60}")
         print(f"[DRONE] 📡 REPLACEMENT REQUEST BROADCAST SENT")
+        print(f"[DRONE] Message ID: {message_id}")
         print(f"[DRONE] Battery: {battery_pct}%")
         print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
         print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
@@ -374,32 +382,41 @@ def handle_battery_low_simulation():
     # Trigger battery low behavior (this will broadcast replacement request)
     handle_battery_low()
 
-def send_handover_response(requesting_drone_ip, requesting_drone_id):
-    """Send handover response to requesting drone with this drone's IP address"""
+def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id):
+    """Broadcast handover response ACK to all drones (not just requesting drone)"""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
         response_msg = json.dumps({
             "message_type": "DRONE_HANDOVER_ACK",
             "message_class": "HANDOVER_RESPONSE",
+            "message_id": message_id,  # The message_id this ACK is responding to
             "sender_id": DRONE_ID,
             "sender_role": ROLE,
             "sender_ip": LOCAL_IP,
             "responder_ip": LOCAL_IP,  # This drone's IP address
             "status": USTATUS,
             "battery_pct": battery_pct,
-            "target_drone_id": requesting_drone_id,
+            "target_drone_id": requesting_drone_id,  # The drone that requested handover
             "timestamp": now()
         }).encode('utf-8')
         
-        sock.sendto(response_msg, (requesting_drone_ip, MESSAGE_PORT))
+        # Broadcast to all drones (not just the requesting drone)
+        sock.sendto(response_msg, ('<broadcast>', MESSAGE_PORT))
         sock.close()
         
+        # Mark this message_id as acknowledged so we don't respond again
+        with handover_ack_lock:
+            acknowledged_handover_ids.add(message_id)
+        
         print(f"\n{'='*60}")
-        print(f"[DRONE] ✅ SENT HANDOVER RESPONSE")
-        print(f"[DRONE] To: {requesting_drone_id} at {requesting_drone_ip}")
+        print(f"[DRONE] ✅ BROADCAST HANDOVER RESPONSE ACK")
+        print(f"[DRONE] Message ID: {message_id}")
+        print(f"[DRONE] For Request From: {requesting_drone_id} at {requesting_drone_ip}")
         print(f"[DRONE] Responder IP: {LOCAL_IP}")
         print(f"[DRONE] Status: {USTATUS}")
+        print(f"[DRONE] This ACK broadcasted to all drones")
         print(f"{'='*60}\n")
         
         return True
@@ -481,38 +498,68 @@ def udp_message_listener():
                     # Another drone is requesting handover/replacement
                     requesting_drone_id = msg.get("sender_id")
                     requesting_drone_ip = msg.get("sender_ip") or addr[0]
+                    message_id = msg.get("message_id")  # Get the message_id from the request
                     receiver_category = msg.get("receiver_category", "").upper()
                     
-                    # Only respond if this message is for drones and this drone is IDLE
-                    if receiver_category == "DRONE" and USTATUS == "IDLE":
-                        print(f"\n{'='*60}")
-                        print(f"[DRONE] 📨 RECEIVED HANDOVER REQUEST")
-                        print(f"[DRONE] From: {requesting_drone_id} at {requesting_drone_ip}")
-                        print(f"[DRONE] Reason: {msg.get('request_reason', 'UNKNOWN')}")
-                        print(f"[DRONE] Location: {msg.get('location', {})}")
-                        print(f"[DRONE] Current Status: {USTATUS}")
-                        print(f"[DRONE] Responding with IP: {LOCAL_IP}")
-                        print(f"{'='*60}\n")
+                    # Print the request details
+                    print(f"\n{'='*60}")
+                    print(f"[DRONE] 📨 RECEIVED HANDOVER REQUEST")
+                    print(f"[DRONE] Message ID: {message_id}")
+                    print(f"[DRONE] From: {requesting_drone_id} at {requesting_drone_ip}")
+                    print(f"[DRONE] Reason: {msg.get('request_reason', 'UNKNOWN')}")
+                    print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}%")
+                    location = msg.get('location', {})
+                    if location:
+                        print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                    print(f"[DRONE] Current Status: {USTATUS}")
+                    print(f"{'='*60}\n")
+                    
+                    # Check if this message_id has already been acknowledged
+                    with handover_ack_lock:
+                        already_acknowledged = message_id in acknowledged_handover_ids
+                    
+                    # Only respond if:
+                    # 1. Message is for drones
+                    # 2. This drone is IDLE
+                    # 3. This message_id hasn't been acknowledged yet
+                    if receiver_category == "DRONE" and USTATUS == "IDLE" and not already_acknowledged:
+                        print(f"[DRONE] ✅ Status is IDLE - Responding with ACK")
+                        print(f"[DRONE] Will replace {requesting_drone_id} at {requesting_drone_ip}\n")
                         
-                        # Send response with this drone's IP address
-                        send_handover_response(requesting_drone_ip, requesting_drone_id)
+                        # Broadcast ACK response to all drones
+                        send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
                     elif receiver_category == "DRONE" and USTATUS != "IDLE":
-                        print(f"[DRONE] Received handover request but status is {USTATUS}, not responding")
+                        print(f"[DRONE] ⚠️  Status is {USTATUS}, not IDLE - Not responding\n")
+                    elif already_acknowledged:
+                        print(f"[DRONE] ⚠️  Message ID {message_id} already acknowledged - Not responding\n")
                 
                 elif msg_type == "DRONE_HANDOVER_ACK" and sender_role == "DRONE":
-                    # Response to our handover request
+                    # Response to a handover request (could be ours or another drone's)
                     responder_drone_id = msg.get("sender_id")
                     responder_ip = msg.get("responder_ip") or msg.get("sender_ip") or addr[0]
                     target_drone_id = msg.get("target_drone_id")
+                    message_id = msg.get("message_id")  # The message_id this ACK is for
                     
+                    # Mark this message_id as acknowledged (so other drones stop responding)
+                    if message_id:
+                        with handover_ack_lock:
+                            acknowledged_handover_ids.add(message_id)
+                    
+                    # If this ACK is for our request
                     if target_drone_id == DRONE_ID:
                         print(f"\n{'='*60}")
-                        print(f"[DRONE] ✅ RECEIVED HANDOVER RESPONSE")
+                        print(f"[DRONE] ✅ RECEIVED HANDOVER RESPONSE ACK")
+                        print(f"[DRONE] Message ID: {message_id}")
                         print(f"[DRONE] From: {responder_drone_id} at {addr[0]}")
                         print(f"[DRONE] Responder IP: {responder_ip}")
                         print(f"[DRONE] Status: {msg.get('status')}, Battery: {msg.get('battery_pct')}%")
                         print(f"[DRONE] Replacement drone available at IP: {responder_ip}")
                         print(f"{'='*60}\n")
+                    else:
+                        # This ACK is for another drone's request - just acknowledge we received it
+                        print(f"[DRONE] 📨 Received handover ACK for {target_drone_id} (message_id: {message_id})")
+                        print(f"[DRONE]    Responder: {responder_drone_id} at {responder_ip}")
+                        print(f"[DRONE]    This message_id is now marked as acknowledged\n")
                 
             except Exception as e:
                 print(f"[DRONE] Error processing message: {e}")
