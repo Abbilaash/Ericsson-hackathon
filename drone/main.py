@@ -54,6 +54,14 @@ replacement_lock = threading.Lock()  # Lock for replacement flag
 acknowledged_handover_ids = set()  # Set of message_ids that have been acknowledged
 handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
 
+# Vision detection state
+vision_active = False
+vision_thread = None
+vision_lock = threading.Lock()
+last_detection_sent_at = 0.0
+DETECTION_VIDEO_SOURCE = 0  # Use default camera
+DETECTION_SEND_INTERVAL_SEC = 2.0  # Throttle how often we send detections
+
 # =========================
 # NETWORK UTILITIES
 # =========================
@@ -199,8 +207,17 @@ def update_position(x, y, z, yaw=None):
         if yaw is not None:
             drone_position["yaw"] = yaw
 
-def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
-    """Send issue detection to base station (will relay to all devices)"""
+def broadcast_issue_detection(issue_type="UNKNOWN", confidence_score=1.0, is_simulation=False):
+    """Send issue detection with confidence score.
+
+    If confidence >= CONFIDENCE_THRESHOLD: send to robots
+    Else: ask another drone to confirm
+    """
+    if issue_type not in ISSUE_TYPES:
+        ensure_issue_type(issue_type)
+
+    confidence_score = max(0.0, min(1.0, float(confidence_score)))
+
     # Get base station IP
     with base_station_lock:
         bs_ip = base_station_ip
@@ -215,45 +232,241 @@ def broadcast_issue_detection(issue_type="UNKNOWN", is_simulation=False):
         # Get current position
         with position_lock:
             pos = drone_position.copy()
-        
-        detection_msg = json.dumps({
-            "message_type": "ISSUE_DETECTION",
+
+        if confidence_score >= CONFIDENCE_THRESHOLD:
+            # High confidence: send directly to robots
+            detection_msg = json.dumps({
+                "message_type": "ISSUE_DETECTION",
+                "message_class": "DETECTION",
+                "sender_id": DRONE_ID,
+                "sender_role": ROLE,
+                "sender_ip": LOCAL_IP,
+                "issue_type": issue_type,
+                "confidence_score": confidence_score,
+                "is_simulation": is_simulation,
+                "receiver_category": "ROBOT",
+                "location": {
+                    "x": pos["x"],
+                    "y": pos["y"],
+                    "z": pos["z"],
+                    "yaw": pos["yaw"]
+                },
+                "status": USTATUS,
+                "battery_pct": battery_pct,
+                "timestamp": now()
+            }).encode('utf-8')
+
+            sock.sendto(detection_msg, (bs_ip, MESSAGE_PORT))
+            sock.close()
+
+            sim_text = " (SIMULATION)" if is_simulation else ""
+            print(f"\n{'='*60}")
+            print(f"[DRONE] 📡 ISSUE DETECTION SENT TO BASE STATION{sim_text}")
+            print(f"[DRONE] Issue Type: {issue_type}")
+            print(f"[DRONE] Confidence: {confidence_score:.2%} (HIGH - to robots)")
+            print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
+            print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
+            print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+            print(f"[DRONE] Base station will relay to robots")
+            print(f"{'='*60}\n")
+        else:
+            # Low confidence: ask another drone to confirm
+            message_id = f"{DRONE_ID}_confirm_{int(now() * 1000)}"
+            confirm_request_msg = json.dumps({
+                "message_type": "DETECTION_CONFIRM_REQUEST",
+                "message_class": "CONFIRMATION_REQUEST",
+                "message_id": message_id,
+                "sender_id": DRONE_ID,
+                "sender_role": ROLE,
+                "sender_ip": LOCAL_IP,
+                "issue_type": issue_type,
+                "confidence_score": confidence_score,
+                "location": {
+                    "x": pos["x"],
+                    "y": pos["y"],
+                    "z": pos["z"],
+                    "yaw": pos["yaw"]
+                },
+                "status": USTATUS,
+                "battery_pct": battery_pct,
+                "timestamp": now()
+            }).encode('utf-8')
+
+            sock.sendto(confirm_request_msg, (bs_ip, MESSAGE_PORT))
+            sock.close()
+
+            print(f"\n{'='*60}")
+            print(f"[DRONE] 📡 DETECTION CONFIRM REQUEST SENT TO BASE STATION")
+            print(f"[DRONE] Issue Type: {issue_type}")
+            print(f"[DRONE] Confidence: {confidence_score:.2%} (LOW - requesting confirmation)")
+            print(f"[DRONE] Message ID: {message_id}")
+            print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
+            print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+            print(f"[DRONE] Base station will send to ONE drone for confirmation")
+            print(f"{'='*60}\n")
+
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to send issue detection: {e}")
+        return False
+
+
+def send_vision_status(status, error=None):
+    """Notify base station about vision pipeline status."""
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        return
+    try:
+        status_msg = {
+            "message_type": "VISION_STATUS",
+            "message_class": "STATUS",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "vision_status": status,
+            "timestamp": now()
+        }
+        if error:
+            status_msg["error"] = str(error)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(json.dumps(status_msg).encode("utf-8"), (bs_ip, MESSAGE_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[DRONE] Vision status send failed: {e}")
+
+
+def publish_vision_detections(predictions: dict):
+    """Send throttled detection results to base station and trigger issue messaging."""
+    global last_detection_sent_at
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        return
+
+    now_ts = now()
+    if (now_ts - last_detection_sent_at) < DETECTION_SEND_INTERVAL_SEC:
+        return
+
+    preds = predictions.get("predictions") or []
+    detections_payload = []
+    for p in preds:
+        detections_payload.append({
+            "class": p.get("class"),
+            "confidence": float(p.get("confidence", 0) or 0),
+            "bbox": p.get("bbox"),
+        })
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        msg = {
+            "message_type": "VISION_DETECTION",
             "message_class": "DETECTION",
             "sender_id": DRONE_ID,
             "sender_role": ROLE,
             "sender_ip": LOCAL_IP,
-            "issue_type": issue_type,
-            "is_simulation": is_simulation,
-            "receiver_category": "DRONE",
-            "location": {
-                "x": pos["x"],
-                "y": pos["y"],
-                "z": pos["z"],
-                "yaw": pos["yaw"]
-            },
-            "status": USTATUS,
-            "battery_pct": battery_pct,
-            "timestamp": now()
-        }).encode('utf-8')
-
-        # Send to base station (will relay to all devices)
-        sock.sendto(detection_msg, (bs_ip, MESSAGE_PORT))
+            "detections": detections_payload,
+            "timestamp": now_ts
+        }
+        sock.sendto(json.dumps(msg).encode("utf-8"), (bs_ip, MESSAGE_PORT))
         sock.close()
-        
-        sim_text = " (SIMULATION)" if is_simulation else ""
-        print(f"\n{'='*60}")
-        print(f"[DRONE] 📡 ISSUE DETECTION SENT TO BASE STATION{sim_text}")
-        print(f"[DRONE] Issue Type: {issue_type}")
-        print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
-        print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
-        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
-        print(f"[DRONE] Base station will relay to all drones")
-        print(f"{'='*60}\n")
-        
-        return True
+        last_detection_sent_at = now_ts
     except Exception as e:
-        print(f"[DRONE] Failed to broadcast issue detection: {e}")
+        print(f"[DRONE] Vision detection send failed: {e}")
+
+    if preds:
+        # Use top prediction to drive issue messaging
+        top_pred = max(preds, key=lambda item: item.get("confidence", 0) or 0)
+        top_label = top_pred.get("class", "unknown")
+        top_conf = float(top_pred.get("confidence", 0) or 0)
+        ensure_issue_type(top_label)
+        broadcast_issue_detection(issue_type=top_label, confidence_score=top_conf, is_simulation=False)
+
+
+def vision_detection_worker():
+    """Run the camera pipeline and stream detections."""
+    global vision_active
+    try:
+        from inference import InferencePipeline
+        from inference.core.interfaces.camera.entities import VideoFrame
+        import supervision as sv
+        import cv2
+    except Exception as e:
+        print(f"[DRONE] Vision pipeline dependencies missing: {e}")
+        send_vision_status("FAILED", error=str(e))
+        with vision_lock:
+            vision_active = False
+        return
+
+    label_annotator = sv.LabelAnnotator()
+    box_annotator = sv.BoxAnnotator()
+
+    def my_custom_sink(predictions: dict, video_frame: VideoFrame):
+        # Annotate and forward detections
+        labels = [
+            f"{p.get('class')} ({p.get('confidence', 0):.2f})"
+            for p in (predictions.get("predictions") or [])
+        ]
+        try:
+            detections = sv.Detections.from_inference(predictions)
+            image = label_annotator.annotate(
+                scene=video_frame.image.copy(), detections=detections, labels=labels
+            )
+            image = box_annotator.annotate(image, detections=detections)
+            cv2.imshow("Predictions", image)
+            cv2.waitKey(1)
+        except Exception as e:
+            print(f"[DRONE] Vision annotate error: {e}")
+
+        try:
+            publish_vision_detections(predictions)
+        except Exception as e:
+            print(f"[DRONE] Vision publish error: {e}")
+
+    try:
+        send_vision_status("STARTING")
+        pipeline = InferencePipeline.init(
+            model_id="yolov8x-1280",
+            video_reference=DETECTION_VIDEO_SOURCE,
+            on_prediction=my_custom_sink,
+        )
+        send_vision_status("STARTED")
+        pipeline.start()
+        pipeline.join()
+    except Exception as e:
+        print(f"[DRONE] Vision pipeline error: {e}")
+        send_vision_status("FAILED", error=str(e))
+    finally:
+        cv2.destroyAllWindows()
+        with vision_lock:
+            vision_active = False
+        send_vision_status("STOPPED")
+
+
+def start_vision_detection():
+    """Start the vision detection thread when commanded by base station."""
+    global vision_thread, vision_active
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        print("[DRONE] Cannot start vision detection - base station IP unknown")
         return False
+
+    with vision_lock:
+        if vision_active:
+            print("[DRONE] Vision detection already running")
+            return False
+        vision_active = True
+
+    print(f"\n{'='*60}")
+    print("[DRONE] 👁️  Starting vision detection on live camera (triggered by base station)")
+    print(f"[DRONE] Video source: {DETECTION_VIDEO_SOURCE}")
+    print(f"{'='*60}\n")
+
+    vision_thread = threading.Thread(target=vision_detection_worker, daemon=True)
+    vision_thread.start()
+    return True
 
 def calculate_3d_spiral_step(tower_pos, radius, current_theta, vertical_speed):
     """Calculate next position in 3D spiral trajectory"""
@@ -275,6 +488,23 @@ SPIRAL_RADIUS = 50.0  # meters - orbital radius around tower
 VERTICAL_SPEED = 5.0  # meters per radian - vertical climb rate
 THETA_INCREMENT = 0.5  # radians - angle increment between points
 TRAJECTORY_POINT_DELAY = 2.0  # seconds to spend at each trajectory point
+
+# Issue detection constants
+ISSUE_TYPES = [
+    "circuit overheat",
+    "circuit rust",
+    "tower tilt",
+    "rust"
+]
+CONFIDENCE_THRESHOLD = 0.7  # If confidence < threshold, request drone confirmation
+
+
+def ensure_issue_type(issue_type: str):
+    """Allow dynamic issue types from vision detections by extending the list when needed."""
+    global ISSUE_TYPES
+    if issue_type not in ISSUE_TYPES:
+        ISSUE_TYPES.append(issue_type)
+        print(f"[DRONE] ⚠️ Added dynamic issue type: {issue_type}")
 
 flight_thread = None
 flight_lock = threading.Lock()
@@ -548,7 +778,7 @@ def udp_message_listener():
                         print(f"[DRONE] Full Message: {json.dumps(msg, indent=2)}")
                         print(f"{'='*60}\n")
                         # Trigger issue detection broadcast (simulation mode)
-                        broadcast_issue_detection(issue_type="TOWER_DAMAGE", is_simulation=True)
+                        broadcast_issue_detection(issue_type="tower tilt", confidence_score=1.0, is_simulation=True)
                 
                 elif msg_type == "DRONE_CONTROL":
                     target_id = msg.get("target_device_id")
@@ -565,6 +795,17 @@ def udp_message_listener():
                             start_flight()
                         elif command == "GROUND":
                             stop_flight()
+
+                elif msg_type == "VISION_CONTROL":
+                    target_id = msg.get("target_device_id")
+                    command = msg.get("command")
+                    if target_id == DRONE_ID and command == "START_DETECTION":
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] 👁️  VISION_CONTROL received - START_DETECTION")
+                        print(f"[DRONE] From: {addr[0]}:{addr[1]}")
+                        print(f"[DRONE] Full Message: {json.dumps(msg, indent=2)}")
+                        print(f"{'='*60}\n")
+                        start_vision_detection()
                 
                 elif msg_class == "REPLACEMENT_REQUEST" and msg['receiver_category'].upper() == "DRONE":
                     # A message is considered DRONE_HANDOVER if message_class is REPLACEMENT_REQUEST and receiver_category is DRONE
@@ -609,13 +850,15 @@ def udp_message_listener():
 
                 elif msg_type == "ISSUE_DETECTION":
                     receiver_category = msg.get("receiver_category", "").upper()
-                    # Only log when broadcast is intended for drones
                     if "DRONE" in receiver_category or receiver_category == "":
                         issue = msg.get("issue_type", "UNKNOWN")
                         location = msg.get("location", {})
+                        conf = msg.get("confidence_score")
                         print(f"\n{'='*60}")
-                        print(f"[DRONE] ⚠️ ISSUE DETECTION RECEIVED")
+                        print(f"[DRONE] ⚠️ ISSUE DETECTION RECEIVED (routed via base station)")
                         print(f"[DRONE] Issue: {issue}")
+                        if conf is not None:
+                            print(f"[DRONE] Confidence: {float(conf):.2%}")
                         if location:
                             print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
                             print(f"[DRONE] Yaw: {location.get('yaw', 0):.4f} rad")
@@ -623,6 +866,23 @@ def udp_message_listener():
                         print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}% | Status: {msg.get('status', 'UNKNOWN')}")
                         print(f"[DRONE] Receiver Category: {receiver_category or 'DRONE (default)'}")
                         print(f"{'='*60}\n")
+
+                elif msg_type == "DETECTION_CONFIRM_REQUEST":
+                    # Another drone is asking us to confirm an issue detection
+                    issue = msg.get("issue_type", "UNKNOWN")
+                    conf = msg.get("confidence_score")
+                    location = msg.get("location", {})
+                    print(f"\n{'='*60}")
+                    print(f"[DRONE] 🔎 DETECTION CONFIRM REQUEST RECEIVED")
+                    print(f"[DRONE] From: {msg.get('sender_id', 'UNKNOWN')} at {addr[0]}")
+                    print(f"[DRONE] Issue: {issue}")
+                    if conf is not None:
+                        print(f"[DRONE] Sender confidence: {float(conf):.2%}")
+                    if location:
+                        print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                        print(f"[DRONE] Yaw: {location.get('yaw', 0):.4f} rad")
+                    print(f"[DRONE] Action: perform visual confirmation and respond (not automated here)")
+                    print(f"{'='*60}\n")
                 
                 elif msg_type == "DRONE_HANDOVER_ACK" and sender_role == "DRONE":
                     # Response to a handover request (could be ours or another drone's)
