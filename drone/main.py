@@ -4,6 +4,16 @@ import socket
 import fxn
 import json
 import math
+from pymavlink import mavutil
+
+# pymavlink motor control
+from pymavlink_arm import (
+    connect as pm_connect,
+    disable_arming_checks,
+    set_mode as pm_set_mode,
+    arm as pm_arm,
+    rc_spin as pm_rc_spin,
+)
 
 ROLE = "DRONE"
 MESSAGE_PORT = 9999
@@ -54,6 +64,14 @@ replacement_lock = threading.Lock()  # Lock for replacement flag
 acknowledged_handover_ids = set()  # Set of message_ids that have been acknowledged
 handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
 
+# pymavlink motor spin settings
+PYMAVLINK_LINK = "COM11"
+PYMAVLINK_BAUD = 115200
+PYMAVLINK_MODE = "STABILIZE"  # avoids GPS requirement
+PYMAVLINK_THROTTLE = 1200
+PYMAVLINK_SPIN_SECONDS = 5.0
+pymavlink_spin_lock = threading.Lock()
+
 # Vision detection state
 vision_active = False
 vision_thread = None
@@ -68,6 +86,68 @@ DETECTION_SEND_INTERVAL_SEC = 2.0  # Throttle how often we send detections
 
 def now():
     return time.time()
+
+
+def _pymavlink_disarm(master):
+    """Best-effort disarm and clear overrides."""
+    try:
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    except Exception:
+        pass
+
+    try:
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    except Exception:
+        pass
+
+
+def engage_motors_via_pymavlink():
+    """Run the pymavlink motor spin when ENGAGE is clicked on this drone."""
+    if not pymavlink_spin_lock.acquire(blocking=False):
+        print("[DRONE] pymavlink motor spin already running; ignoring duplicate ENGAGE")
+        return
+
+    def _run():
+        master = None
+        try:
+            print(f"[DRONE] Connecting via pymavlink on {PYMAVLINK_LINK} @ {PYMAVLINK_BAUD}")
+            master = pm_connect(PYMAVLINK_LINK, PYMAVLINK_BAUD)
+            disable_arming_checks(master)
+            pm_set_mode(master, PYMAVLINK_MODE)
+            pm_arm(master)
+            pm_rc_spin(master, PYMAVLINK_THROTTLE, PYMAVLINK_SPIN_SECONDS)
+        except Exception as exc:
+            print(f"[DRONE] pymavlink motor spin failed: {exc}")
+        finally:
+            if master:
+                print("[DRONE] Stopping pymavlink motor spin and disarming")
+                _pymavlink_disarm(master)
+            pymavlink_spin_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 def send_discovery_broadcast():
     """Broadcast discovery message to join the network"""
@@ -792,6 +872,7 @@ def udp_message_listener():
                         print(f"{'='*60}\n")
                         
                         if command == "ENGAGE":
+                            engage_motors_via_pymavlink()
                             start_flight()
                         elif command == "GROUND":
                             stop_flight()
