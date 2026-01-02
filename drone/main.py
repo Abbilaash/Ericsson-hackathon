@@ -6,15 +6,6 @@ import json
 import math
 from pymavlink import mavutil
 
-# pymavlink motor control
-from pymavlink_arm import (
-    connect as pm_connect,
-    disable_arming_checks,
-    set_mode as pm_set_mode,
-    arm as pm_arm,
-    rc_spin as pm_rc_spin,
-)
-
 ROLE = "DRONE"
 MESSAGE_PORT = 9999
 
@@ -67,7 +58,7 @@ handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
 # pymavlink motor spin settings
 PYMAVLINK_LINK = "COM11"
 PYMAVLINK_BAUD = 115200
-PYMAVLINK_MODE = "STABILIZE"  # avoids GPS requirement
+PYMAVLINK_MODE = "STABILIZE"
 PYMAVLINK_THROTTLE = 1200
 PYMAVLINK_SPIN_SECONDS = 5.0
 pymavlink_spin_lock = threading.Lock()
@@ -88,9 +79,140 @@ def now():
     return time.time()
 
 
-def _pymavlink_disarm(master):
-    """Best-effort disarm and clear overrides."""
+# =========================
+# PYMAVLINK MOTOR CONTROL
+# =========================
+
+def pm_connect(link: str, baud: int) -> mavutil.mavfile:
+    """Connect to the drone via pymavlink."""
+    master = mavutil.mavlink_connection(link, baud=baud)
+    print(f"[PYMAVLINK] Waiting for heartbeat on {link} @ {baud}...")
+    master.wait_heartbeat()
+    print("[PYMAVLINK] Heartbeat received")
+    return master
+
+
+def pm_disable_arming_checks(master: mavutil.mavfile) -> None:
+    """Force the Pixhawk to ignore GPS and other health checks."""
+    print("[PYMAVLINK] Bypassing all arming checks and safety switch...")
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        b"ARMING_CHECK",
+        0,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        b"BRD_SAFETYENABLE",
+        0,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    time.sleep(2)
+
+
+def pm_set_mode(master: mavutil.mavfile, mode: str) -> None:
+    """Set flight mode."""
+    modes = master.mode_mapping()
+    if mode not in modes:
+        raise ValueError(f"Mode {mode} not in vehicle mode map: {list(modes.keys())}")
+    mode_id = modes[mode]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id,
+    )
+    print(f"[PYMAVLINK] Mode set command sent: {mode}")
+
+
+def pm_arm(master: mavutil.mavfile, timeout: float = 15.0) -> None:
+    """Arm the motors."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    print("[PYMAVLINK] Arm command sent, waiting for confirmation...")
+
+    start = time.time()
+    while True:
+        if master.motors_armed():
+            print("[PYMAVLINK] >>> MOTORS ARMED <<<")
+            return
+
+        master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            0,
+        )
+
+        msg = master.recv_match(type="STATUSTEXT", blocking=False)
+        if msg:
+            print(f"[PYMAVLINK] PIXHAWK MESSAGE: {msg.text}")
+
+        if time.time() - start > timeout:
+            raise TimeoutError("Timed out waiting for arming. Is the battery connected?")
+
+        time.sleep(0.2)
+
+
+def pm_rc_spin(master: mavutil.mavfile, throttle_pwm: int, duration: float) -> None:
+    """Spin motors at specified throttle."""
+    start = time.time()
+    print(f"[PYMAVLINK] Spinning at {throttle_pwm} PWM for {duration}s...")
+    while time.time() - start < duration:
+        master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            0,
+        )
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            65535,
+            65535,
+            throttle_pwm,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+        )
+        time.sleep(0.1)
+
+
+def pm_main() -> None:
+    """Run pymavlink motor control sequence."""
+    # --- SETTINGS ---
+    LINK = PYMAVLINK_LINK
+    BAUD = PYMAVLINK_BAUD
+    MODE = PYMAVLINK_MODE
+    THROTTLE = PYMAVLINK_THROTTLE
+    SECONDS = PYMAVLINK_SPIN_SECONDS
+    # ----------------
+
+    master = pm_connect(LINK, BAUD)
+    pm_disable_arming_checks(master)
+    pm_set_mode(master, MODE)
+    pm_arm(master)
+
     try:
+        pm_rc_spin(master, THROTTLE, SECONDS)
+    finally:
+        print("[PYMAVLINK] Stopping and Disarming...")
         master.mav.rc_channels_override_send(
             master.target_system,
             master.target_component,
@@ -103,10 +225,6 @@ def _pymavlink_disarm(master):
             0,
             0,
         )
-    except Exception:
-        pass
-
-    try:
         master.mav.command_long_send(
             master.target_system,
             master.target_component,
@@ -120,31 +238,21 @@ def _pymavlink_disarm(master):
             0,
             0,
         )
-    except Exception:
-        pass
+        print("[PYMAVLINK] Done.")
 
 
 def engage_motors_via_pymavlink():
-    """Run the pymavlink motor spin when ENGAGE is clicked on this drone."""
+    """Run pymavlink motor spin when ENGAGE is clicked on this drone."""
     if not pymavlink_spin_lock.acquire(blocking=False):
-        print("[DRONE] pymavlink motor spin already running; ignoring duplicate ENGAGE")
+        print("[DRONE] Motor spin already running; ignoring duplicate ENGAGE")
         return
 
     def _run():
-        master = None
         try:
-            print(f"[DRONE] Connecting via pymavlink on {PYMAVLINK_LINK} @ {PYMAVLINK_BAUD}")
-            master = pm_connect(PYMAVLINK_LINK, PYMAVLINK_BAUD)
-            disable_arming_checks(master)
-            pm_set_mode(master, PYMAVLINK_MODE)
-            pm_arm(master)
-            pm_rc_spin(master, PYMAVLINK_THROTTLE, PYMAVLINK_SPIN_SECONDS)
+            pm_main()
         except Exception as exc:
-            print(f"[DRONE] pymavlink motor spin failed: {exc}")
+            print(f"[DRONE] Motor spin failed: {exc}")
         finally:
-            if master:
-                print("[DRONE] Stopping pymavlink motor spin and disarming")
-                _pymavlink_disarm(master)
             pymavlink_spin_lock.release()
 
     threading.Thread(target=_run, daemon=True).start()
