@@ -9,6 +9,8 @@ import socket
 import threading
 import time
 from typing import Optional
+import os
+import platform
 
 
 # RealSense imports - only needed for FIXER robots
@@ -18,6 +20,14 @@ try:
 except ImportError:
 	REALSENSE_AVAILABLE = False
 	rs = None
+
+# Battery detection imports
+try:
+	import psutil
+	BATTERY_DETECTION_AVAILABLE = True
+except ImportError:
+	BATTERY_DETECTION_AVAILABLE = False
+	psutil = None
 
 
 ROLE = "ROBOT"
@@ -80,6 +90,30 @@ def log(msg: str) -> None:
 	print(f"[ROBOT] {msg}")
 
 
+def detect_realsense_devices() -> bool:
+	"""Detect if RealSense camera is connected (Ubuntu compatible)"""
+	if not REALSENSE_AVAILABLE:
+		return False
+	
+	try:
+		context = rs.context()
+		devices = context.query_devices()
+		
+		if len(devices) == 0:
+			log("⚠️  No RealSense devices detected")
+			return False
+		
+		for dev in devices:
+			dev_name = dev.get_info(rs.camera_info.name)
+			dev_serial = dev.get_info(rs.camera_info.serial_number)
+			log(f"✅ Found RealSense device: {dev_name} (Serial: {dev_serial})")
+		
+		return True
+	except Exception as exc:
+		log(f"⚠️  Error detecting RealSense devices: {exc}")
+		return False
+
+
 def init_realsense_camera():
 	"""Initialize RealSense D455 camera for distance measurement (FIXER only)"""
 	global realsense_pipeline
@@ -89,7 +123,15 @@ def init_realsense_camera():
 		return False
 	
 	if not REALSENSE_AVAILABLE:
-		log("RealSense not available, distance measurement disabled")
+		log("❌ RealSense library not installed (pyrealsense2)")
+		log("   On Ubuntu, install: pip install pyrealsense2")
+		return False
+	
+	# Check if devices are available
+	if not detect_realsense_devices():
+		log("❌ No RealSense camera detected")
+		log("   On Ubuntu, check: lsusb | grep RealSense")
+		log("   Or run: sudo udevadm control --reload-rules")
 		return False
 	
 	try:
@@ -105,10 +147,14 @@ def init_realsense_camera():
 			pipeline.start(config)
 			realsense_pipeline = pipeline
 			
-			log("RealSense D455 camera initialized successfully")
+			log("✅ RealSense D455 camera initialized successfully")
 			return True
 	except Exception as exc:
-		log(f"Failed to initialize RealSense camera: {exc}")
+		log(f"❌ Failed to initialize RealSense camera: {exc}")
+		if "Permission denied" in str(exc) or "libusb" in str(exc):
+			log("   Try: sudo python3 robots/main.py")
+		if "IPC" in str(exc) or "USB" in str(exc):
+			log("   Check USB connection and permissions on Ubuntu")
 		return False
 
 
@@ -669,10 +715,57 @@ def battery_monitor() -> None:
 	global battery_pct, robot_status
 	while True:
 		time.sleep(STATUS_INTERVAL_SEC)
+		# Update battery percentage from system
+		battery_pct = get_battery_percentage()
+		
 		if battery_pct < BATTERY_THRESHOLD:
 			robot_status = "INACTIVE"
-			log("Battery low; marking inactive and sending status")
+			log(f"⚠️  Battery low ({battery_pct:.1f}%); marking inactive and sending status")
 			send_status_update()
+		else:
+			if battery_pct < 30:
+				log(f"🔋 Battery at {battery_pct:.1f}% - consider charging soon")
+
+
+def get_battery_percentage() -> float:
+	"""Get system battery percentage (Ubuntu compatible using psutil)"""
+	global battery_pct
+	
+	if BATTERY_DETECTION_AVAILABLE:
+		try:
+			battery = psutil.sensors_battery()
+			if battery:
+				new_pct = battery.percent
+				if 0 <= new_pct <= 100:
+					return new_pct
+		except Exception:
+			pass
+	
+	# Try reading from /sys/class/power_supply (Linux native)
+	if os.path.exists("/sys/class/power_supply/BAT0/capacity"):
+		try:
+			with open("/sys/class/power_supply/BAT0/capacity", "r") as f:
+				bat_pct = float(f.read().strip())
+				if 0 <= bat_pct <= 100:
+					return bat_pct
+		except Exception:
+			pass
+	
+	# Try alternative battery paths for different systems
+	for bat_path in ["/sys/class/power_supply/BAT1/capacity",
+	                  "/sys/class/power_supply/BAT/capacity",
+	                  "/sys/class/power_supply/battery/capacity"]:
+		if os.path.exists(bat_path):
+			try:
+				with open(bat_path, "r") as f:
+					bat_pct = float(f.read().strip())
+					if 0 <= bat_pct <= 100:
+						return bat_pct
+			except Exception:
+				pass
+	
+	# Return current battery_pct if detection fails
+	return battery_pct
 
 
 def main() -> None:
