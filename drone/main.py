@@ -1,737 +1,1157 @@
-"""
-Lightweight robot network client.
-Mirrors the drone network behavior: broadcast discovery, receive base station ACK, send heartbeats, and listen for commands.
-Reinforcement learning is intentionally omitted.
-"""
-
-import json
-import socket
-import threading
 import time
-from typing import Optional
+import threading
+import socket
+import fxn
+import json
+import math
+from pymavlink import mavutil
 
-
-# RealSense imports - only needed for FIXER robots
-try:
-	import pyrealsense2 as rs
-	REALSENSE_AVAILABLE = True
-except ImportError:
-	REALSENSE_AVAILABLE = False
-	rs = None
-
-
-ROLE = "ROBOT"
+ROLE = "DRONE"
 MESSAGE_PORT = 9999
-DISCOVERY_PORT = 9998
-HEARTBEAT_INTERVAL_SEC = 60
-STATUS_INTERVAL_SEC = 30
-BATTERY_THRESHOLD = 15.0
 
-# FIXER robot constants
-TARGET_DISTANCE_CM = 50.0       # Stop distance from tower
-DISTANCE_TOLERANCE_CM = 5.0     # ±5cm tolerance
-PART_DELIVERY_TIME_SEC = 10.0   # WAITER delivery time
+# UNIVERSAL STATUS
+USTATUS = 'IDLE'
 
-
-def get_local_ip() -> str:
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		sock.connect(("8.8.8.8", 80))
-		ip = sock.getsockname()[0]
-		sock.close()
-		return ip
-	except Exception:
-		return "127.0.0.1"
-
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 LOCAL_IP = get_local_ip()
-ROBOT_ID = f"robot_{LOCAL_IP.replace('.', '')}"
-
-# Robot type configuration - SET THIS TO 'FIXER' OR 'WAITER'
-ROBOT_TYPE = "FIXER"  # Change to "WAITER" for part delivery robots
-
-# Shared state
-base_station_ip: Optional[str] = None
-base_station_lock = threading.Lock()
-battery_pct = 90.0
-robot_status = "ACTIVE"  # ACTIVE | BUSY | INACTIVE | DELIVERING
-current_task = None
-task_lock = threading.Lock()
-moving_to_tower = False
-movement_lock = threading.Lock()
-part_request_active = False  # Track if FIXER is waiting for parts
-part_request_lock = threading.Lock()
-current_issue_type = None  # Store current issue being fixed
-
-# RealSense camera state (FIXER only)
-realsense_pipeline = None
-realsense_lock = threading.Lock()
-
-# UDP listener ready flag
-listener_ready = False
-listener_ready_lock = threading.Lock()
-
-
-def now() -> float:
-	return time.time()
-
-
-def log(msg: str) -> None:
-	print(f"[ROBOT] {msg}")
-
-
-def init_realsense_camera():
-	"""Initialize RealSense D455 camera for distance measurement (FIXER only)"""
-	global realsense_pipeline
-	
-	# Only FIXER robots need camera
-	if ROBOT_TYPE != "FIXER":
-		return False
-	
-	if not REALSENSE_AVAILABLE:
-		log("RealSense not available, distance measurement disabled")
-		return False
-	
-	try:
-		with realsense_lock:
-			pipeline = rs.pipeline()
-			config = rs.config()
-			
-			# Configure depth and color streams
-			config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-			config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-			
-			# Start streaming
-			pipeline.start(config)
-			realsense_pipeline = pipeline
-			
-			log("RealSense D455 camera initialized successfully")
-			return True
-	except Exception as exc:
-		log(f"Failed to initialize RealSense camera: {exc}")
-		return False
-
-
-def get_distance_to_tower():
-	"""Get distance to tower in centimeters using RealSense camera (FIXER only)"""
-	# Only FIXER robots can measure distance
-	if ROBOT_TYPE != "FIXER":
-		return None
-	
-	if not REALSENSE_AVAILABLE or realsense_pipeline is None:
-		return None
-	
-	try:
-		with realsense_lock:
-			# Wait for frames
-			frames = realsense_pipeline.wait_for_frames(timeout_ms=1000)
-			
-			# Align depth to color
-			align = rs.align(rs.stream.color)
-			aligned_frames = align.process(frames)
-			depth_frame = aligned_frames.get_depth_frame()
-			
-			if not depth_frame:
-				return None
-			
-			# Get distance at center pixel
-			width = depth_frame.get_width()
-			height = depth_frame.get_height()
-			center_x, center_y = width // 2, height // 2
-			
-			# Get distance in meters, convert to cm
-			distance_m = depth_frame.get_distance(center_x, center_y)
-			distance_cm = distance_m * 100.0
-			
-			return distance_cm
-	except Exception as exc:
-		log(f"Error measuring distance: {exc}")
-		return None
-
-
-def send_part_request(issue_type: str):
-	"""FIXER: Send part request to base station (relayed to WAITER robots)"""
-	global part_request_active
-	
-	with base_station_lock:
-		bs_ip = base_station_ip
-	
-	if not bs_ip:
-		log("Cannot send part request - base station IP unknown")
-		return False
-	
-	try:
-		with part_request_lock:
-			part_request_active = True
-		
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		
-		part_request_msg = json.dumps({
-			"message_type": "PART_REQUEST",
-			"message_class": "PART_REQUEST",
-			"sender_id": ROBOT_ID,
-			"sender_role": ROLE,
-			"sender_ip": LOCAL_IP,
-			"robot_type": ROBOT_TYPE,
-			"issue_type": issue_type,
-			"receiver_category": "WAITER",
-			"timestamp": now(),
-		}).encode('utf-8')
-		
-		sock.sendto(part_request_msg, (bs_ip, MESSAGE_PORT))
-		sock.close()
-		
-		log(f"\n{'='*60}")
-		log(f"🔧 PART REQUEST SENT")
-		log(f"Issue Type: {issue_type}")
-		log(f"Waiting for WAITER robot to deliver parts...")
-		log(f"{'='*60}\n")
-		
-		return True
-	except Exception as e:
-		log(f"Failed to send part request: {e}")
-		return False
-
-
-def move_to_tower_and_fix():
-	"""FIXER: Move robot to tower, request parts, and fix issue"""
-	global moving_to_tower, robot_status, current_issue_type
-	
-	with movement_lock:
-		if moving_to_tower:
-			log("Already moving to tower")
-			return
-		moving_to_tower = True
-	
-	robot_status = "BUSY"
-	log(f"\n{'='*60}")
-	log("🚗 FIXER: STARTING MOVEMENT TOWARD TOWER")
-	log(f"Issue: {current_issue_type}")
-	log(f"Target distance: {TARGET_DISTANCE_CM}cm")
-	log(f"{'='*60}\n")
-	
-	if not REALSENSE_AVAILABLE or realsense_pipeline is None:
-		log("❌ Cannot move: RealSense camera not available")
-		with movement_lock:
-			moving_to_tower = False
-		robot_status = "ACTIVE"
-		return
-	
-	try:
-		# Phase 1: Move to tower
-		log("Phase 1: Moving to tower...")
-		while moving_to_tower:
-			distance_cm = get_distance_to_tower()
-			
-			if distance_cm is None:
-				log("⚠️  Cannot measure distance, retrying...")
-				time.sleep(0.5)
-				continue
-			
-			log(f"📏 Distance to tower: {distance_cm:.1f}cm")
-			
-			if abs(distance_cm - TARGET_DISTANCE_CM) <= DISTANCE_TOLERANCE_CM:
-				log(f"\n{'='*60}")
-				log(f"✅ REACHED TARGET DISTANCE: {distance_cm:.1f}cm")
-				log("🛑 STOPPED AT TOWER")
-				log(f"{'='*60}\n")
-				break
-			
-			elif distance_cm > TARGET_DISTANCE_CM + DISTANCE_TOLERANCE_CM:
-				log(f"⬆️  Moving forward (distance: {distance_cm:.1f}cm)")
-				# TODO: Send actual motor control commands here
-				time.sleep(0.5)
-			else:
-				log(f"✅ Within target range: {distance_cm:.1f}cm")
-				break
-			
-			time.sleep(0.2)
-		
-		# Phase 2: Request parts
-		log("\nPhase 2: Requesting parts from WAITER robots...")
-		send_part_request(current_issue_type)
-		
-		# Phase 3: Wait for parts delivery
-		log("Phase 3: Waiting for parts...")
-		wait_time = 0
-		max_wait = 60  # Wait up to 60 seconds
-		with part_request_lock:
-			while part_request_active and wait_time < max_wait:
-				time.sleep(1)
-				wait_time += 1
-				if wait_time % 10 == 0:
-					log(f"Still waiting for parts... ({wait_time}s)")
-		
-		# Phase 4: Fix the issue
-		log("\nPhase 4: Fixing issue...")
-		log(f"🔧 Fixing {current_issue_type}...")
-		time.sleep(5)  # Simulate fixing time
-		log(f"✅ Issue fixed: {current_issue_type}")
-		
-	except Exception as exc:
-		log(f"❌ Error during tower approach: {exc}")
-		import traceback
-		traceback.print_exc()
-	finally:
-		log("\n🛑 FIXER: Task complete, returning to base")
-		with movement_lock:
-			moving_to_tower = False
-		with part_request_lock:
-			part_request_active = False
-		current_issue_type = None
-		robot_status = "ACTIVE"
-
-
-def deliver_parts_to_fixer(fixer_id: str, issue_type: str):
-	"""WAITER: Deliver parts to FIXER robot"""
-	global robot_status
-	
-	robot_status = "DELIVERING"
-	log(f"\n{'='*60}")
-	log("📦 WAITER: STARTING PART DELIVERY")
-	log(f"Delivering to: {fixer_id}")
-	log(f"Part for issue: {issue_type}")
-	log(f"{'='*60}\n")
-	
-	try:
-		# Simulate movement to fixer
-		log("🚚 Moving to FIXER location...")
-		for i in range(int(PART_DELIVERY_TIME_SEC)):
-			log(f"Delivering... {i+1}/{int(PART_DELIVERY_TIME_SEC)}s")
-			time.sleep(1)
-		
-		log(f"\n✅ Parts delivered to {fixer_id}")
-		log("Returning to base\n")
-		
-	except Exception as exc:
-		log(f"❌ Delivery error: {exc}")
-	finally:
-		robot_status = "ACTIVE"
-
-
-def send_part_delivery_ack(fixer_id: str, issue_type: str):
-	"""WAITER: Send ACK to base station that parts are being delivered"""
-	with base_station_lock:
-		bs_ip = base_station_ip
-	
-	if not bs_ip:
-		log("Cannot send part delivery ACK - base station IP unknown")
-		return False
-	
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		
-		ack_msg = json.dumps({
-			"message_type": "PART_DELIVERY_ACK",
-			"message_class": "PART_ACK",
-			"sender_id": ROBOT_ID,
-			"sender_role": ROLE,
-			"sender_ip": LOCAL_IP,
-			"robot_type": ROBOT_TYPE,
-			"target_fixer_id": fixer_id,
-			"issue_type": issue_type,
-			"timestamp": now(),
-		}).encode('utf-8')
-		
-		sock.sendto(ack_msg, (bs_ip, MESSAGE_PORT))
-		sock.close()
-		
-		log(f"✅ PART_DELIVERY_ACK sent to base station")
-		return True
-	except Exception as e:
-		log(f"Failed to send part delivery ACK: {e}")
-		return False
-
-
-def send_discovery_broadcast() -> bool:
-	"""Broadcast discovery so the base station can reply with its IP."""
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-		discovery_msg = json.dumps({
-			"type": "DISCOVERY",
-			"device_id": ROBOT_ID,
-			"role": ROLE,
-			"ip": LOCAL_IP,
-			"robot_type": ROBOT_TYPE,  # Include robot type (FIXER/WAITER)
-			"battery_status": battery_pct,
-			"timestamp": now(),
-		}).encode("utf-8")
-
-		sock.sendto(discovery_msg, ("<broadcast>", DISCOVERY_PORT))
-		sock.close()
-		log(f"Discovery broadcast sent (Type: {ROBOT_TYPE})")
-		return True
-	except Exception as exc:
-		log(f"Failed to send discovery broadcast: {exc}")
-		return False
-
-def handle_issue_detection(msg: dict) -> None:
-	"""Handle ISSUE_DETECTION message - FIXER moves to tower and fixes"""
-	global current_issue_type
-	
-	issue_type = msg.get("issue_type", "UNKNOWN")
-	confidence = msg.get("confidence_score", 0.0)
-	location = msg.get("location", {})
-	
-	log(f"\n{'='*60}")
-	log(f"🚨 ISSUE DETECTION RECEIVED")
-	log(f"Issue Type: {issue_type}")
-	log(f"Confidence: {confidence:.2%}")
-	if location:
-		log(f"Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
-	log(f"Robot Type: {ROBOT_TYPE}")
-	log(f"{'='*60}\n")
-	
-	if ROBOT_TYPE == "FIXER":
-		log(f"🔧 FIXER robot activated for issue: {issue_type}")
-		current_issue_type = issue_type
-		# Start movement to tower, request parts, and fix in separate thread
-		threading.Thread(target=move_to_tower_and_fix, daemon=True).start()
-	else:
-		log(f"⏸️  WAITER robot - ignoring issue detection (not a fixer)")
-
-
-def handle_part_request(msg: dict) -> None:
-	"""WAITER: Handle part request from FIXER robot"""
-	# Only WAITER robots should respond
-	if ROBOT_TYPE != "WAITER":
-		return
-	
-	fixer_id = msg.get("sender_id")
-	issue_type = msg.get("issue_type", "UNKNOWN")
-	
-	log(f"\n{'='*60}")
-	log(f"📦 PART REQUEST RECEIVED")
-	log(f"From FIXER: {fixer_id}")
-	log(f"Issue Type: {issue_type}")
-	log(f"{'='*60}\n")
-	
-	# Send ACK to base station
-	log("Sending ACK to base station...")
-	send_part_delivery_ack(fixer_id, issue_type)
-	
-	# Start delivery in separate thread
-	log("Starting part delivery...")
-	threading.Thread(target=deliver_parts_to_fixer, args=(fixer_id, issue_type), daemon=True).start()
-
-
-def handle_part_delivery_ack(msg: dict) -> None:
-	"""FIXER: Handle acknowledgment from WAITER that parts are being delivered"""
-	global part_request_active
-	
-	# Only FIXER robots care about this
-	if ROBOT_TYPE != "FIXER":
-		return
-	
-	target_fixer = msg.get("target_fixer_id")
-	
-	# Check if this ACK is for us
-	if target_fixer != ROBOT_ID:
-		return
-	
-	waiter_id = msg.get("sender_id")
-	issue_type = msg.get("issue_type")
-	
-	log(f"\n{'='*60}")
-	log(f"✅ PART DELIVERY ACK RECEIVED")
-	log(f"From WAITER: {waiter_id}")
-	log(f"Issue: {issue_type}")
-	log(f"Parts are on the way!")
-	log(f"{'='*60}\n")
-	
-	# Mark that we received response
-	with part_request_lock:
-		part_request_active = False
-
-def send_heartbeat() -> None:
-	with base_station_lock:
-		bs_ip = base_station_ip
-
-	if not bs_ip:
-		return
-
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		heartbeat_msg = json.dumps({
-			"type": "HEARTBEAT",
-			"message_type": "HEARTBEAT",
-			"sender_id": ROBOT_ID,
-			"sender_role": ROLE,
-			"sender_ip": LOCAL_IP,
-			"status": robot_status,
-			"battery_pct": battery_pct,
-			"timestamp": now(),
-		}).encode("utf-8")
-		sock.sendto(heartbeat_msg, (bs_ip, MESSAGE_PORT))
-		sock.close()
-		log(f"Heartbeat sent to base station at {bs_ip}")
-	except Exception as exc:
-		log(f"Failed to send heartbeat: {exc}")
-
-
-def heartbeat_worker() -> None:
-	while True:
-		time.sleep(HEARTBEAT_INTERVAL_SEC)
-		send_heartbeat()
-
-
-def status_worker() -> None:
-	"""Periodic status updates (e.g., busy/active)."""
-	while True:
-		time.sleep(STATUS_INTERVAL_SEC)
-		send_status_update()
-
-
-def send_status_update() -> None:
-	with base_station_lock:
-		bs_ip = base_station_ip
-	if not bs_ip:
-		return
-
-	with task_lock:
-		task_id = current_task
-
-	payload = {
-		"message_type": "STATUS",
-		"sender_id": ROBOT_ID,
-		"sender_role": ROLE,
-		"sender_ip": LOCAL_IP,
-		"status": robot_status,
-		"battery_pct": battery_pct,
-		"timestamp": now(),
-		"robot_status": {
-			"battery_pct": battery_pct,
-			"busy": robot_status == "BUSY",
-			"current_task": task_id,
-		},
-	}
-
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		sock.sendto(json.dumps(payload).encode("utf-8"), (bs_ip, MESSAGE_PORT))
-		sock.close()
-		log(f"Status update sent to {bs_ip}")
-	except Exception as exc:
-		log(f"Failed to send status update: {exc}")
-
-
-def set_base_station_ip(ip: str) -> None:
-	global base_station_ip
-	with base_station_lock:
-		base_station_ip = ip
-	log(f"Base station IP set to {ip}")
-
-
-def handle_base_station_ack(msg: dict) -> None:
-	ip = msg.get("base_station_ip")
-	if ip:
-		set_base_station_ip(ip)
-		print(f"\n{'='*60}")
-		print(f"[ROBOT] ✅ RECEIVED BASE STATION ACK")
-		print(f"[ROBOT] Base Station IP: {ip}")
-		print(f"[ROBOT] Sender ID: {msg.get('sender_id')}")
-		print(f"[ROBOT] Full Message: {json.dumps(msg, indent=2)}")
-		print(f"[ROBOT] Status: Connected to network")
-		print(f"[ROBOT] Starting heartbeat sender (every {HEARTBEAT_INTERVAL_SEC} seconds)")
-		print(f"{'='*60}\n")
-	else:
-		log("BASE_STATION_ACK received but no base_station_ip field found")
-
-
-def handle_task(msg: dict) -> None:
-	global robot_status, current_task
-	task = msg.get("task") or msg.get("task_id")
-	if not task:
-		return
-	with task_lock:
-		current_task = task if isinstance(task, str) else task.get("task_id")
-	robot_status = "BUSY"
-	log(f"Received task: {current_task}")
-	send_task_ack(current_task)
-
-
-def send_task_ack(task_id: Optional[str]) -> None:
-	if not task_id:
-		return
-	with base_station_lock:
-		bs_ip = base_station_ip
-	if not bs_ip:
-		return
-
-	ack = {
-		"message_type": "ACK",
-		"sender_id": ROBOT_ID,
-		"sender_role": ROLE,
-		"sender_ip": LOCAL_IP,
-		"acknowledged_task_id": task_id,
-		"timestamp": now(),
-	}
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		sock.sendto(json.dumps(ack).encode("utf-8"), (bs_ip, MESSAGE_PORT))
-		sock.close()
-		log(f"Sent ACK for task {task_id}")
-	except Exception as exc:
-		log(f"Failed to send task ACK: {exc}")
-
-
-def handle_control(msg: dict) -> None:
-	global robot_status
-	command = msg.get("command") or msg.get("action")
-	if not command:
-		return
-	cmd = command.upper()
-	log(f"Received control command: {cmd}")
-	if cmd == "ENGAGE":
-		robot_status = "BUSY"
-	elif cmd == "GROUND":
-		robot_status = "INACTIVE"
-	else:
-		robot_status = robot_status
-
-
-def handle_packet(msg: dict, addr) -> None:
-	msg_type = msg.get("message_type") or msg.get("type")
-	sender_id = msg.get("sender_id")
-	sender_role = msg.get("sender_role", "").upper()
-	
-	# Print all received messages for visibility
-	print(f"\n{'='*60}")
-	print(f"[ROBOT] 📨 RECEIVED MESSAGE")
-	print(f"[ROBOT] From: {addr[0]}:{addr[1]}")
-	print(f"[ROBOT] Message Type: {msg_type}")
-	print(f"[ROBOT] Sender ID: {sender_id or 'UNKNOWN'}")
-	print(f"[ROBOT] Sender Role: {sender_role or 'UNKNOWN'}")
-	print(f"{'='*60}\n")
-	
-	if msg_type == "BASE_STATION_ACK":
-		handle_base_station_ack(msg)
-		return
-
-	if msg_type == "ISSUE_DETECTION":
-		handle_issue_detection(msg)
-		return
-	
-	if msg_type == "PART_REQUEST":
-		handle_part_request(msg)
-		return
-	
-	if msg_type == "PART_DELIVERY_ACK":
-		handle_part_delivery_ack(msg)
-		return
-
-	if msg_type == "REQUEST" or msg_type == "TASK":
-		handle_task(msg)
-		return
-
-	if msg_type == "CONTROL":
-		handle_control(msg)
-		return
-
-	# Fallback logging
-	log(f"Unhandled message from {addr}: {msg_type}")
-
-
-def udp_listener() -> None:
-	global listener_ready
-	try:
-		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-		sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-		sock.bind(("", MESSAGE_PORT))
-		
-		# Mark listener as ready
-		with listener_ready_lock:
-			listener_ready = True
-		
-		log(f"✅ UDP listener READY on port {MESSAGE_PORT}")
-		log(f"✅ Listening on {LOCAL_IP}:{MESSAGE_PORT}")
-		log(f"Waiting for BASE_STATION_ACK...")
-
-		while True:
-			data, addr = sock.recvfrom(8192)
-			log(f"📥 Raw packet received from {addr[0]}:{addr[1]} ({len(data)} bytes)")
-			try:
-				msg = json.loads(data.decode("utf-8"))
-				log(f"✅ Decoded: {msg.get('message_type', msg.get('type', 'UNKNOWN'))}")
-			except Exception as e:
-				log(f"❌ JSON decode error from {addr}: {e}")
-				continue
-			handle_packet(msg, addr)
-	except Exception as exc:
-		log(f"❌ UDP listener FAILED: {exc}")
-		import traceback
-		traceback.print_exc()
-
-
-def battery_monitor() -> None:
-	global battery_pct, robot_status
-	while True:
-		time.sleep(STATUS_INTERVAL_SEC)
-		if battery_pct < BATTERY_THRESHOLD:
-			robot_status = "INACTIVE"
-			log("Battery low; marking inactive and sending status")
-			send_status_update()
-
-
-def main() -> None:
-	log(f"Starting {ROBOT_ID}")
-	log(f"Local IP: {LOCAL_IP}")
-	log(f"Robot Type: {ROBOT_TYPE}")
-	log(f"{'='*60}")
-	
-	# Initialize RealSense camera only for FIXER robots
-	if ROBOT_TYPE == "FIXER":
-		log("Initializing RealSense camera for distance measurement...")
-		if init_realsense_camera():
-			log("✅ Camera ready for tower detection")
-		else:
-			log("⚠️  Camera initialization failed - distance measurement unavailable")
-	else:
-		log("WAITER robot - no camera needed (part delivery mode)")
-
-	# Start all background threads
-	log("Starting UDP listener thread...")
-	threading.Thread(target=udp_listener, daemon=True).start()
-	
-	log("Starting heartbeat worker thread...")
-	threading.Thread(target=heartbeat_worker, daemon=True).start()
-	
-	log("Starting status worker thread...")
-	threading.Thread(target=status_worker, daemon=True).start()
-	
-	log("Starting battery monitor thread...")
-	threading.Thread(target=battery_monitor, daemon=True).start()
-
-	# Wait for UDP listener to be ready
-	log("Waiting for UDP listener to initialize...")
-	max_wait = 5  # Wait up to 5 seconds
-	wait_time = 0
-	while wait_time < max_wait:
-		with listener_ready_lock:
-			if listener_ready:
-				break
-		time.sleep(0.1)
-		wait_time += 0.1
-	
-	if not listener_ready:
-		log("⚠️  WARNING: UDP listener may not be ready!")
-	else:
-		log("✅ All systems ready!")
-	
-	log(f"{'='*60}")
-	log("📡 Sending discovery broadcast...")
-	send_discovery_broadcast()
-	log(f"{'='*60}")
-
-	# Simple run loop
-	try:
-		while True:
-			time.sleep(1)
-	except KeyboardInterrupt:
-		log("Shutting down")
-
+DRONE_ID = f"drone_{LOCAL_IP.replace('.', '')}"
+BATTERY_THRESHOLD = 15.0
+
+print(f"[DRONE] Local IP: {LOCAL_IP}")  
+print(f"[DRONE] Drone ID: {DRONE_ID}")
+print(f"[DRONE] Message Port: {MESSAGE_PORT}")
+
+# =========================
+# STATE
+# =========================
+
+battery_pct = fxn.get_battery_percentage() or 90.0
+# Base station configuration
+DISCOVERY_PORT = 9998  # Port for discovery broadcasts
+base_station_ip = None  # Base station IP (received from ACK)
+base_station_lock = threading.Lock()  # Lock for base_station_ip
+HEARTBEAT_INTERVAL_SEC = 60  # Send heartbeat every 60 seconds
+
+# Position tracking (will be updated when drone flies)
+drone_position = {
+    "x": 0.0,  # meters
+    "y": 0.0,  # meters
+    "z": 10.0,  # meters (altitude)
+    "yaw": 0.0  # radians
+}
+position_lock = threading.Lock()  # Lock for position updates
+replacement_broadcast_sent = False  # Track if replacement request already sent
+replacement_lock = threading.Lock()  # Lock for replacement flag
+# Track acknowledged handover message IDs (so drones don't respond to already-acknowledged requests)
+acknowledged_handover_ids = set()  # Set of message_ids that have been acknowledged
+handover_ack_lock = threading.Lock()  # Lock for acknowledged_handover_ids
+
+# pymavlink motor control settings
+PYMAVLINK_LINK = "COM11"
+PYMAVLINK_BAUD = 38400
+PYMAVLINK_MODE = "STABILIZE"
+PYMAVLINK_THROTTLE = 1200
+pymavlink_spin_lock = threading.Lock()
+pymavlink_master = None  # Will hold active MAVLink connection
+motors_spinning = False  # Flag to control motor spin state
+
+# Vision detection state
+vision_active = False
+vision_thread = None
+vision_lock = threading.Lock()
+last_detection_sent_at = 0.0
+DETECTION_VIDEO_SOURCE = 0  # Use default camera
+DETECTION_SEND_INTERVAL_SEC = 2.0  # Throttle how often we send detections
+
+# =========================
+# NETWORK UTILITIES
+# =========================
+
+def now():
+    return time.time()
+
+
+# =========================
+# PYMAVLINK MOTOR CONTROL
+# =========================
+
+def pm_connect(link: str, baud: int) -> mavutil.mavfile:
+    """Connect to the drone via pymavlink."""
+    master = mavutil.mavlink_connection(link, baud=baud)
+    print(f"[PYMAVLINK] Waiting for heartbeat on {link} @ {baud}...")
+    master.wait_heartbeat()
+    print("[PYMAVLINK] Heartbeat received")
+    return master
+
+
+def pm_disable_arming_checks(master: mavutil.mavfile) -> None:
+    """Force the Pixhawk to ignore GPS and other health checks."""
+    print("[PYMAVLINK] Bypassing all arming checks and safety switch...")
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        b"ARMING_CHECK",
+        0,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        b"BRD_SAFETYENABLE",
+        0,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    time.sleep(2)
+
+
+def pm_set_mode(master: mavutil.mavfile, mode: str) -> None:
+    """Set flight mode."""
+    modes = master.mode_mapping()
+    if mode not in modes:
+        raise ValueError(f"Mode {mode} not in vehicle mode map: {list(modes.keys())}")
+    mode_id = modes[mode]
+    master.mav.set_mode_send(
+        master.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        mode_id,
+    )
+    print(f"[PYMAVLINK] Mode set command sent: {mode}")
+
+
+def pm_arm(master: mavutil.mavfile, timeout: float = 15.0) -> None:
+    """Arm the motors."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    print("[PYMAVLINK] Arm command sent, waiting for confirmation...")
+
+    start = time.time()
+    while True:
+        if master.motors_armed():
+            print("[PYMAVLINK] >>> MOTORS ARMED <<<")
+            return
+
+        master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            0,
+        )
+
+        msg = master.recv_match(type="STATUSTEXT", blocking=False)
+        if msg:
+            print(f"[PYMAVLINK] PIXHAWK MESSAGE: {msg.text}")
+
+        if time.time() - start > timeout:
+            raise TimeoutError("Timed out waiting for arming. Is the battery connected?")
+
+        time.sleep(0.2)
+
+
+def pm_rc_spin(master: mavutil.mavfile, throttle_pwm: int) -> None:
+    """Spin motors at specified throttle indefinitely until flight_active is False."""
+    global motors_spinning
+    print(f"[PYMAVLINK] Spinning at {throttle_pwm} PWM (will continue until GROUND command)...")
+    motors_spinning = True
+    while flight_active and motors_spinning:
+        master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            0,
+        )
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            65535,
+            65535,
+            throttle_pwm,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+        )
+        time.sleep(0.1)
+    motors_spinning = False
+
+
+def pm_main() -> None:
+    """Run pymavlink motor control sequence."""
+    global pymavlink_master
+    # --- SETTINGS ---
+    LINK = PYMAVLINK_LINK
+    BAUD = PYMAVLINK_BAUD
+    MODE = PYMAVLINK_MODE
+    THROTTLE = PYMAVLINK_THROTTLE
+    # ----------------
+
+    master = pm_connect(LINK, BAUD)
+    pymavlink_master = master  # Store reference for later access
+    pm_disable_arming_checks(master)
+    pm_set_mode(master, MODE)
+    pm_arm(master)
+
+    try:
+        pm_rc_spin(master, THROTTLE)
+    finally:
+        print("[PYMAVLINK] Stopping and Disarming...")
+        master.mav.rc_channels_override_send(
+            master.target_system,
+            master.target_component,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        print("[PYMAVLINK] Done.")
+
+
+def engage_motors_via_pymavlink():
+    """Run pymavlink motor spin when ENGAGE is clicked on this drone."""
+    if not pymavlink_spin_lock.acquire(blocking=False):
+        print("[DRONE] Motor spin already running; ignoring duplicate ENGAGE")
+        return
+
+    def _run():
+        try:
+            pm_main()
+        except Exception as exc:
+            print(f"[DRONE] Motor spin failed: {exc}")
+        finally:
+            pymavlink_spin_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+def send_discovery_broadcast():
+    """Broadcast discovery message to join the network"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        discovery_msg = json.dumps({
+            "type": "DISCOVERY",
+            "device_id": DRONE_ID,
+            "role": ROLE,
+            "ip": LOCAL_IP,
+            "battery_status": battery_pct,
+            "timestamp": now()
+        }).encode('utf-8')
+        
+        sock.sendto(discovery_msg, ('<broadcast>', DISCOVERY_PORT))
+        sock.close()
+        print(f"[DRONE] 📡 Discovery broadcast sent")
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to send discovery broadcast: {e}")
+        return False
+
+def send_heartbeat():
+    """Send UDP heartbeat to base station every 60 seconds"""
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        # Base station IP not known yet, skip heartbeat
+        return
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        heartbeat_msg = json.dumps({
+            "type": "HEARTBEAT",
+            "message_type": "HEARTBEAT",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "status": USTATUS,
+            "battery_pct": battery_pct,
+            "timestamp": now()
+        }).encode('utf-8')
+        
+        sock.sendto(heartbeat_msg, (bs_ip, MESSAGE_PORT))
+        sock.close()
+        print(f"[DRONE] 💓 Heartbeat sent to base station at {bs_ip}")
+    except Exception as e:
+        print(f"[DRONE] Failed to send heartbeat: {e}")
+
+def heartbeat_sender():
+    """Periodically send heartbeat signals to base station"""
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL_SEC)
+        send_heartbeat()
+
+def broadcast_replacement_request():
+    global replacement_broadcast_sent
+    
+    with replacement_lock:
+        if replacement_broadcast_sent:
+            return
+        replacement_broadcast_sent = True
+    
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send replacement request - base station IP unknown")
+        with replacement_lock:
+            replacement_broadcast_sent = False
+        return False
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        # Get current position
+        with position_lock:
+            pos = drone_position.copy()
+        
+        # Generate unique message_id for this handover request
+        message_id = f"{DRONE_ID}_{int(now() * 1000)}"  # Unique ID: drone_id + timestamp
+        
+        replacement_msg = json.dumps({
+            "message_type": "DRONE_HANDOVER",
+            "message_class": "REPLACEMENT_REQUEST",
+            "message_id": message_id,  # Unique ID for this request
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "request_reason": "BATTERY_LOW",
+            "battery_pct": battery_pct,
+            "status": USTATUS,
+            "location": {
+                "x": pos["x"],
+                "y": pos["y"],
+                "z": pos["z"],
+                "yaw": pos["yaw"]
+            },
+            "receiver_category": "DRONE",  # Only drones should respond
+            "timestamp": now()
+        }).encode('utf-8')
+
+        # Send to base station (will relay to all devices)
+        sock.sendto(replacement_msg, (bs_ip, MESSAGE_PORT))
+        sock.close()
+        
+        print(f"\n{'='*60}")
+        print(f"[DRONE] 📡 HANDOVER REQUEST SENT TO BASE STATION")
+        print(f"[DRONE] Message ID: {message_id}")
+        print(f"[DRONE] Status: {USTATUS} (IDLE/ACTIVE status of requesting drone)")
+        print(f"[DRONE] Battery: {battery_pct}%")
+        print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
+        print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
+        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+        print(f"[DRONE] Base station will relay to all drones")
+        print(f"{'='*60}\n")
+        
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to broadcast replacement request: {e}")
+        with replacement_lock:
+            replacement_broadcast_sent = False  # Reset on failure
+        return False
+
+def update_position(x, y, z, yaw=None):
+    """Update drone position (called when drone moves)"""
+    global drone_position
+    with position_lock:
+        drone_position["x"] = x
+        drone_position["y"] = y
+        drone_position["z"] = z
+        if yaw is not None:
+            drone_position["yaw"] = yaw
+
+def broadcast_issue_detection(issue_type="UNKNOWN", confidence_score=1.0, is_simulation=False):
+    """Send issue detection with confidence score.
+
+    If confidence >= CONFIDENCE_THRESHOLD: send to robots
+    Else: ask another drone to confirm
+    """
+    if issue_type not in ISSUE_TYPES:
+        ensure_issue_type(issue_type)
+
+    confidence_score = max(0.0, min(1.0, float(confidence_score)))
+
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send issue detection - base station IP unknown")
+        return False
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Get current position
+        with position_lock:
+            pos = drone_position.copy()
+
+        if confidence_score >= CONFIDENCE_THRESHOLD:
+            # High confidence: send directly to robots
+            detection_msg = json.dumps({
+                "message_type": "ISSUE_DETECTION",
+                "message_class": "DETECTION",
+                "sender_id": DRONE_ID,
+                "sender_role": ROLE,
+                "sender_ip": LOCAL_IP,
+                "issue_type": issue_type,
+                "confidence_score": confidence_score,
+                "is_simulation": is_simulation,
+                "receiver_category": "ROBOT",
+                "location": {
+                    "x": pos["x"],
+                    "y": pos["y"],
+                    "z": pos["z"],
+                    "yaw": pos["yaw"]
+                },
+                "status": USTATUS,
+                "battery_pct": battery_pct,
+                "timestamp": now()
+            }).encode('utf-8')
+
+            sock.sendto(detection_msg, (bs_ip, MESSAGE_PORT))
+            sock.close()
+
+            sim_text = " (SIMULATION)" if is_simulation else ""
+            print(f"\n{'='*60}")
+            print(f"[DRONE] 📡 ISSUE DETECTION SENT TO BASE STATION{sim_text}")
+            print(f"[DRONE] Issue Type: {issue_type}")
+            print(f"[DRONE] Confidence: {confidence_score:.2%} (HIGH - to robots)")
+            print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
+            print(f"[DRONE] Yaw: {pos['yaw']:.4f} rad")
+            print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+            print(f"[DRONE] Base station will relay to robots")
+            print(f"{'='*60}\n")
+        else:
+            # Low confidence: ask another drone to confirm
+            message_id = f"{DRONE_ID}_confirm_{int(now() * 1000)}"
+            confirm_request_msg = json.dumps({
+                "message_type": "DETECTION_CONFIRM_REQUEST",
+                "message_class": "CONFIRMATION_REQUEST",
+                "message_id": message_id,
+                "sender_id": DRONE_ID,
+                "sender_role": ROLE,
+                "sender_ip": LOCAL_IP,
+                "issue_type": issue_type,
+                "confidence_score": confidence_score,
+                "location": {
+                    "x": pos["x"],
+                    "y": pos["y"],
+                    "z": pos["z"],
+                    "yaw": pos["yaw"]
+                },
+                "status": USTATUS,
+                "battery_pct": battery_pct,
+                "timestamp": now()
+            }).encode('utf-8')
+
+            sock.sendto(confirm_request_msg, (bs_ip, MESSAGE_PORT))
+            sock.close()
+
+            print(f"\n{'='*60}")
+            print(f"[DRONE] 📡 DETECTION CONFIRM REQUEST SENT TO BASE STATION")
+            print(f"[DRONE] Issue Type: {issue_type}")
+            print(f"[DRONE] Confidence: {confidence_score:.2%} (LOW - requesting confirmation)")
+            print(f"[DRONE] Message ID: {message_id}")
+            print(f"[DRONE] Location: X={pos['x']:.2f}m, Y={pos['y']:.2f}m, Z={pos['z']:.2f}m")
+            print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+            print(f"[DRONE] Base station will send to ONE drone for confirmation")
+            print(f"{'='*60}\n")
+
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to send issue detection: {e}")
+        return False
+
+
+def send_vision_status(status, error=None):
+    """Notify base station about vision pipeline status."""
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        return
+    try:
+        status_msg = {
+            "message_type": "VISION_STATUS",
+            "message_class": "STATUS",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "vision_status": status,
+            "timestamp": now()
+        }
+        if error:
+            status_msg["error"] = str(error)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(json.dumps(status_msg).encode("utf-8"), (bs_ip, MESSAGE_PORT))
+        sock.close()
+    except Exception as e:
+        print(f"[DRONE] Vision status send failed: {e}")
+
+
+def publish_vision_detections(predictions: dict):
+    """Send throttled detection results to base station and trigger issue messaging."""
+    global last_detection_sent_at
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        return
+
+    now_ts = now()
+    if (now_ts - last_detection_sent_at) < DETECTION_SEND_INTERVAL_SEC:
+        return
+
+    preds = predictions.get("predictions") or []
+    detections_payload = []
+    for p in preds:
+        detections_payload.append({
+            "class": p.get("class"),
+            "confidence": float(p.get("confidence", 0) or 0),
+            "bbox": p.get("bbox"),
+        })
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        msg = {
+            "message_type": "VISION_DETECTION",
+            "message_class": "DETECTION",
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "detections": detections_payload,
+            "timestamp": now_ts
+        }
+        sock.sendto(json.dumps(msg).encode("utf-8"), (bs_ip, MESSAGE_PORT))
+        sock.close()
+        last_detection_sent_at = now_ts
+    except Exception as e:
+        print(f"[DRONE] Vision detection send failed: {e}")
+
+    if preds:
+        # Use top prediction to drive issue messaging
+        top_pred = max(preds, key=lambda item: item.get("confidence", 0) or 0)
+        top_label = top_pred.get("class", "unknown")
+        top_conf = float(top_pred.get("confidence", 0) or 0)
+        ensure_issue_type(top_label)
+        broadcast_issue_detection(issue_type=top_label, confidence_score=top_conf, is_simulation=False)
+
+
+def vision_detection_worker():
+    """Run the camera pipeline and stream detections."""
+    global vision_active
+    try:
+        from inference import InferencePipeline
+        from inference.core.interfaces.camera.entities import VideoFrame
+        import supervision as sv
+        import cv2
+    except Exception as e:
+        print(f"[DRONE] Vision pipeline dependencies missing: {e}")
+        send_vision_status("FAILED", error=str(e))
+        with vision_lock:
+            vision_active = False
+        return
+
+    label_annotator = sv.LabelAnnotator()
+    box_annotator = sv.BoxAnnotator()
+
+    def my_custom_sink(predictions: dict, video_frame: VideoFrame):
+        # Annotate and forward detections
+        labels = [
+            f"{p.get('class')} ({p.get('confidence', 0):.2f})"
+            for p in (predictions.get("predictions") or [])
+        ]
+        try:
+            detections = sv.Detections.from_inference(predictions)
+            image = label_annotator.annotate(
+                scene=video_frame.image.copy(), detections=detections, labels=labels
+            )
+            image = box_annotator.annotate(image, detections=detections)
+            cv2.imshow("Predictions", image)
+            cv2.waitKey(1)
+        except Exception as e:
+            print(f"[DRONE] Vision annotate error: {e}")
+
+        try:
+            publish_vision_detections(predictions)
+        except Exception as e:
+            print(f"[DRONE] Vision publish error: {e}")
+
+    try:
+        send_vision_status("STARTING")
+        pipeline = InferencePipeline.init(
+            model_id="yolov8x-1280",
+            video_reference=DETECTION_VIDEO_SOURCE,
+            on_prediction=my_custom_sink,
+        )
+        send_vision_status("STARTED")
+        pipeline.start()
+        pipeline.join()
+    except Exception as e:
+        print(f"[DRONE] Vision pipeline error: {e}")
+        send_vision_status("FAILED", error=str(e))
+    finally:
+        cv2.destroyAllWindows()
+        with vision_lock:
+            vision_active = False
+        send_vision_status("STOPPED")
+
+
+def start_vision_detection():
+    """Start the vision detection thread when commanded by base station."""
+    global vision_thread, vision_active
+    with base_station_lock:
+        bs_ip = base_station_ip
+    if not bs_ip:
+        print("[DRONE] Cannot start vision detection - base station IP unknown")
+        return False
+
+    with vision_lock:
+        if vision_active:
+            print("[DRONE] Vision detection already running")
+            return False
+        vision_active = True
+
+    print(f"\n{'='*60}")
+    print("[DRONE] 👁️  Starting vision detection on live camera (triggered by base station)")
+    print(f"[DRONE] Video source: {DETECTION_VIDEO_SOURCE}")
+    print(f"{'='*60}\n")
+
+    vision_thread = threading.Thread(target=vision_detection_worker, daemon=True)
+    vision_thread.start()
+    return True
+
+def calculate_3d_spiral_step(tower_pos, radius, current_theta, vertical_speed):
+    """Calculate next position in 3D spiral trajectory"""
+    # 1. Calculate next X and Y (Orbital)
+    target_x = tower_pos["x"] + radius * math.cos(current_theta)
+    target_y = tower_pos["y"] + radius * math.sin(current_theta)
+    
+    # 2. Calculate next Z (Vertical climb)
+    target_z = tower_pos["z"] + (vertical_speed * current_theta)
+    
+    # 3. Calculate Yaw (Point camera to center)
+    target_yaw = math.atan2(tower_pos["y"] - target_y, tower_pos["x"] - target_x)
+    
+    return [target_x, target_y, target_z, target_yaw]
+
+# Trajectory parameters
+TOWER_POSITION = {"x": 0.0, "y": 0.0, "z": 10.0}  # Tower at origin, base height 10m
+SPIRAL_RADIUS = 50.0  # meters - orbital radius around tower
+VERTICAL_SPEED = 5.0  # meters per radian - vertical climb rate
+THETA_INCREMENT = 0.5  # radians - angle increment between points
+TRAJECTORY_POINT_DELAY = 2.0  # seconds to spend at each trajectory point
+
+# Issue detection constants
+ISSUE_TYPES = [
+    "circuit overheat",
+    "circuit rust",
+    "tower tilt",
+    "rust",
+    "component miss"
+]
+CONFIDENCE_THRESHOLD = 0.7  # If confidence < threshold, request drone confirmation
+
+
+def ensure_issue_type(issue_type: str):
+    """Allow dynamic issue types from vision detections by extending the list when needed."""
+    global ISSUE_TYPES
+    if issue_type not in ISSUE_TYPES:
+        ISSUE_TYPES.append(issue_type)
+        print(f"[DRONE] ⚠️ Added dynamic issue type: {issue_type}")
+
+flight_thread = None
+flight_lock = threading.Lock()
+flight_active = False
+
+def flight_loop():
+    """Main flight loop: fly -> follow trajectory -> loop"""
+    global USTATUS, flight_active
+    
+    print(f"\n{'='*60}")
+    print(f"[DRONE] 🚁 FLIGHT LOOP STARTED")
+    print(f"[DRONE] Status: {USTATUS}")
+    print(f"{'='*60}\n")
+    
+    current_theta = 0.0
+    
+    while True:
+        with flight_lock:
+            if not flight_active or USTATUS != "ACTIVE":
+                print(f"[DRONE] 🛬 Flight loop stopping - Status: {USTATUS}")
+                break
+        
+        # Calculate next trajectory point
+        point = calculate_3d_spiral_step(TOWER_POSITION, SPIRAL_RADIUS, current_theta, VERTICAL_SPEED)
+        target_x, target_y, target_z, target_yaw = point
+        
+        # Update position (simulating movement to target)
+        update_position(target_x, target_y, target_z, target_yaw)
+        
+        print(f"[DRONE] 🚁 Flying to: X={target_x:.2f}m, Y={target_y:.2f}m, Z={target_z:.2f}m, Theta={current_theta:.2f}rad")
+        
+        # Simulate time to reach point
+        time.sleep(TRAJECTORY_POINT_DELAY)
+        
+        # Increment theta for next point
+        current_theta += THETA_INCREMENT
+        
+        # Reset theta if we've completed a full rotation (optional)
+        if current_theta >= 2 * math.pi * 2:  # 2 full rotations
+            current_theta = 0.0
+            print(f"[DRONE] 🔄 Completed trajectory cycle, restarting...")
+    
+    # Landing sequence
+    print(f"\n{'='*60}")
+    print(f"[DRONE] 🛬 LANDING SEQUENCE INITIATED")
+    print(f"{'='*60}\n")
+    
+    # Gradually descend to ground
+    current_z = drone_position["z"]
+    while current_z > 0.5:  # Land to 0.5m above ground
+        current_z = max(0.5, current_z - 2.0)  # Descend 2m per second
+        update_position(drone_position["x"], drone_position["y"], current_z, drone_position["yaw"])
+        print(f"[DRONE] 🛬 Descending to Z={current_z:.2f}m")
+        time.sleep(1.0)
+    
+    # Final landing
+    update_position(drone_position["x"], drone_position["y"], 0.0, drone_position["yaw"])
+    print(f"[DRONE] ✅ LANDED - Position: X={drone_position['x']:.2f}m, Y={drone_position['y']:.2f}m, Z=0.0m")
+    print(f"{'='*60}\n")
+
+def start_flight():
+    """Start the flight loop in a separate thread"""
+    global flight_thread, flight_active, USTATUS
+    
+    with flight_lock:
+        if flight_active:
+            print(f"[DRONE] Flight already active")
+            return
+        
+        flight_active = True
+        USTATUS = "ACTIVE"
+        flight_thread = threading.Thread(target=flight_loop, daemon=True)
+        flight_thread.start()
+        print(f"[DRONE] ✅ Flight started - Status: {USTATUS}")
+
+def stop_motors():
+    """Stop motors and disarm gracefully"""
+    global motors_spinning, pymavlink_master
+    
+    motors_spinning = False
+    if pymavlink_master:
+        try:
+            print("[PYMAVLINK] Stopping motors and disarming...")
+            pymavlink_master.mav.rc_channels_override_send(
+                pymavlink_master.target_system,
+                pymavlink_master.target_component,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            )
+            pymavlink_master.mav.command_long_send(
+                pymavlink_master.target_system,
+                pymavlink_master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            )
+            print("[PYMAVLINK] Motors stopped and disarmed")
+        except Exception as e:
+            print(f"[PYMAVLINK] Error stopping motors: {e}")
+
+def stop_flight():
+    """Stop the flight loop and land"""
+    global flight_active, USTATUS
+    
+    with flight_lock:
+        if not flight_active:
+            print(f"[DRONE] Flight not active")
+            return
+        
+        print(f"[DRONE] 🛬 Ground command received - Initiating landing...")
+        USTATUS = "IDLE"
+        flight_active = False
+        stop_motors()  # Stop motors when landing
+        print(f"[DRONE] ✅ Flight stopped - Status: {USTATUS}")
+
+# =========================
+# EVENT HANDLERS
+# =========================
+
+
+# =========================
+# LISTENERS
+# =========================
+
+def handle_battery_low():
+    global battery_pct, USTATUS
+        
+    if battery_pct < BATTERY_THRESHOLD:
+        print(f"\n{'='*60}")
+        print(f"[DRONE] CRITICAL: Battery at {battery_pct}%")
+        print(f"[DRONE] Battery low threshold reached ({BATTERY_THRESHOLD}%)")
+        print(f"[DRONE] Status changed to BATTERY_LOW")
+        print(f"{'='*60}\n")
+        USTATUS = 'BATTERY_LOW'
+        broadcast_replacement_request()
+
+def battery_monitor():
+    """Periodically monitor battery level and trigger low battery handling"""
+    global battery_pct
+        
+    while True:
+        try:
+            # Update battery level from sensor
+            new_battery = fxn.get_battery_percentage()
+            if new_battery is not None:
+                battery_pct = new_battery
+            
+            # Check if battery is low
+            if battery_pct < BATTERY_THRESHOLD and USTATUS != 'BATTERY_LOW':
+                # Battery just dropped below threshold - handle it
+                handle_battery_low()
+            
+            # Check battery every 10 seconds
+            time.sleep(10)
+        except Exception as e:
+            print(f"[DRONE] Battery monitor error: {e}")
+            time.sleep(10)
+
+def handle_battery_low_simulation():
+    """Handle battery low simulation - set battery to 14.0% and trigger low battery functions"""
+    global battery_pct, USTATUS
+    
+    print(f"\n{'='*60}")
+    print(f"[DRONE] 🔋 BATTERY LOW SIMULATION TRIGGERED")
+    print(f"[DRONE] Setting battery to 14.0%")
+    print(f"{'='*60}\n")
+    
+    # Set battery to 14.0% for simulation
+    battery_pct = 14.0
+    
+    # Trigger battery low behavior (this will broadcast replacement request)
+    handle_battery_low()
+
+def send_handover_response(requesting_drone_ip, requesting_drone_id, message_id):
+    """Send handover response ACK to base station (will relay to all drones)"""
+    # Get base station IP
+    with base_station_lock:
+        bs_ip = base_station_ip
+    
+    if bs_ip is None:
+        print(f"[DRONE] Cannot send handover ACK - base station IP unknown")
+        return False
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        response_msg = json.dumps({
+            "message_type": "DRONE_HANDOVER_ACK",
+            "message_class": "HANDOVER_RESPONSE",
+            "message_id": message_id,  # The message_id this ACK is responding to
+            "sender_id": DRONE_ID,
+            "sender_role": ROLE,
+            "sender_ip": LOCAL_IP,
+            "responder_ip": LOCAL_IP,  # This drone's IP address
+            "status": USTATUS,
+            "battery_pct": battery_pct,
+            "target_drone_id": requesting_drone_id,  # The drone that requested handover
+            "timestamp": now()
+        }).encode('utf-8')
+        
+        # Send to base station (will relay to all drones)
+        sock.sendto(response_msg, (bs_ip, MESSAGE_PORT))
+        sock.close()
+        
+        # Mark this message_id as acknowledged so we don't respond again
+        with handover_ack_lock:
+            acknowledged_handover_ids.add(message_id)
+        
+        print(f"\n{'='*60}")
+        print(f"[DRONE] ✅ HANDOVER ACK SENT TO BASE STATION")
+        print(f"[DRONE] Message ID: {message_id}")
+        print(f"[DRONE] For Request From: {requesting_drone_id} at {requesting_drone_ip}")
+        print(f"[DRONE] Responder IP: {LOCAL_IP}")
+        print(f"[DRONE] Status: {USTATUS}")
+        print(f"[DRONE] Sent to: Base Station at {bs_ip}:{MESSAGE_PORT}")
+        print(f"[DRONE] Base station will relay to all drones")
+        print(f"{'='*60}\n")
+        
+        return True
+    except Exception as e:
+        print(f"[DRONE] Failed to send handover response: {e}")
+        return False
+
+def udp_message_listener():
+    """UDP listener to receive messages from base station and other drones"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Enable broadcast reception (though not always required, helps on some systems)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("", MESSAGE_PORT))
+        print(f"[DRONE] 📡 UDP message listener started on port {MESSAGE_PORT}")
+        print(f"[DRONE]    Listening for broadcast messages on all interfaces")
+        print(f"[DRONE]    Buffer size: 4096 bytes (max message size)")
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(8192)
+                msg = json.loads(data.decode('utf-8'))
+                msg_type = msg.get("message_type")
+                msg_class = msg.get("message_class", "UNKNOWN")
+                sender_role = msg.get("sender_role", "").upper()
+                sender_id = msg.get("sender_id")
+                
+                # Ignore messages from ourselves
+                if sender_id == DRONE_ID:
+                    continue
+                
+                # Print all received messages
+                print(f"\n{'='*60}")
+                print(f"[DRONE] 📨 RECEIVED MESSAGE (via Base Station)")
+                print(f"[DRONE] From: {addr[0]}:{addr[1]}")
+                print(f"[DRONE] Message Type: {msg_type}")
+                print(f"[DRONE] Message Class: {msg_class}")
+                print(f"[DRONE] Sender Role: {sender_role}")
+                print(f"[DRONE] Sender ID: {sender_id or 'UNKNOWN'}")
+                print(f"[DRONE] Full Message:")
+                print(json.dumps(msg, indent=2))
+                print(f"{'='*60}\n")
+                
+                if msg_type == "BASE_STATION_ACK":
+                    bs_ip = msg.get("base_station_ip")
+                    if bs_ip:
+                        with base_station_lock:
+                            base_station_ip = bs_ip
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] ✅ RECEIVED BASE STATION ACK")
+                        print(f"[DRONE] Base Station IP: {bs_ip}")
+                        print(f"[DRONE] Status: Connected to network")
+                        print(f"[DRONE] Starting heartbeat sender (every {HEARTBEAT_INTERVAL_SEC} seconds)")
+                        print(f"{'='*60}\n")
+                
+                elif msg_type == "BATTERY_LOW_SIMULATION":
+                    target_id = msg.get("target_device_id")
+                    if target_id == DRONE_ID:
+                        handle_battery_low_simulation()
+                
+                elif msg_type == "ISSUE_DETECTION_SIMULATION":
+                    target_id = msg.get("target_device_id")
+                    if target_id == DRONE_ID:
+                        broadcast_issue_detection(issue_type="tower tilt", confidence_score=1.0, is_simulation=True)
+                
+                elif msg_type == "DRONE_CONTROL":
+                    target_id = msg.get("target_device_id")
+                    command = msg.get("command")
+                    if target_id == DRONE_ID:
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] 🎮 DRONE CONTROL COMMAND RECEIVED")
+                        print(f"[DRONE] Command: {command}")
+                        print(f"[DRONE] {'='*60}\n")
+                        
+                        if command == "ENGAGE":
+                            print(f"[DRONE] Engaging motors and starting flight...")
+                            engage_motors_via_pymavlink()
+                            start_flight()
+                        elif command == "GROUND":
+                            print(f"[DRONE] Grounding drone...")
+                            stop_flight()
+
+                elif msg_type == "VISION_CONTROL":
+                    target_id = msg.get("target_device_id")
+                    command = msg.get("command")
+                    if target_id == DRONE_ID and command == "START_DETECTION":
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] 👁️  VISION_CONTROL - START_DETECTION")
+                        print(f"[DRONE] {'='*60}\n")
+                        start_vision_detection()
+                
+                elif msg_class == "REPLACEMENT_REQUEST" and msg['receiver_category'].upper() == "DRONE":
+                    # A message is considered DRONE_HANDOVER if message_class is REPLACEMENT_REQUEST and receiver_category is DRONE
+                    requesting_drone_id = msg.get("sender_id")
+                    requesting_drone_ip = msg.get("sender_ip") or addr[0]
+                    message_id = msg.get("message_id")  # Get the message_id from the request
+                    receiver_category = msg.get("receiver_category", "").upper()
+                    
+                    # Print the request details
+                    requesting_status = msg.get('status', 'UNKNOWN')
+                    print(f"\n{'='*60}")
+                    print(f"[DRONE] 📨 RECEIVED HANDOVER REQUEST")
+                    print(f"[DRONE] Message ID: {message_id}")
+                    print(f"[DRONE] From: {requesting_drone_id} at {requesting_drone_ip}")
+                    print(f"[DRONE] Requesting Drone Status: {requesting_status} (IDLE/ACTIVE)")
+                    print(f"[DRONE] Reason: {msg.get('request_reason', 'UNKNOWN')}")
+                    print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}%")
+                    location = msg.get('location', {})
+                    if location:
+                        print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                    print(f"[DRONE] Current Status (This Drone): {USTATUS}")
+                    print(f"{'='*60}\n")
+                    
+                    # Check if this message_id has already been acknowledged
+                    with handover_ack_lock:
+                        already_acknowledged = message_id in acknowledged_handover_ids
+                    
+                    # Only respond if:
+                    # 1. Message is for drones
+                    # 2. This drone is IDLE
+                    # 3. This message_id hasn't been acknowledged yet
+                    if receiver_category == "DRONE" and USTATUS == "IDLE" and not already_acknowledged:
+                        print(f"[DRONE] ✅ Status is IDLE - Responding with ACK")
+                        print(f"[DRONE] Will replace {requesting_drone_id} at {requesting_drone_ip}\n")
+                        
+                        # Broadcast ACK response to all drones
+                        send_handover_response(requesting_drone_ip, requesting_drone_id, message_id)
+                    elif receiver_category == "DRONE" and USTATUS != "IDLE":
+                        print(f"[DRONE] ⚠️  Status is {USTATUS}, not IDLE - Not responding\n")
+                    elif already_acknowledged:
+                        print(f"[DRONE] ⚠️  Message ID {message_id} already acknowledged - Not responding\n")
+
+                elif msg_type == "ISSUE_DETECTION":
+                    receiver_category = msg.get("receiver_category", "").upper()
+                    if "DRONE" in receiver_category or receiver_category == "":
+                        issue = msg.get("issue_type", "UNKNOWN")
+                        location = msg.get("location", {})
+                        conf = msg.get("confidence_score")
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] ⚠️ ISSUE DETECTION RECEIVED (routed via base station)")
+                        print(f"[DRONE] Issue: {issue}")
+                        if conf is not None:
+                            print(f"[DRONE] Confidence: {float(conf):.2%}")
+                        if location:
+                            print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                            print(f"[DRONE] Yaw: {location.get('yaw', 0):.4f} rad")
+                        print(f"[DRONE] From: {msg.get('sender_id', 'UNKNOWN')} at {addr[0]}")
+                        print(f"[DRONE] Battery: {msg.get('battery_pct', 'N/A')}% | Status: {msg.get('status', 'UNKNOWN')}")
+                        print(f"[DRONE] Receiver Category: {receiver_category or 'DRONE (default)'}")
+                        print(f"{'='*60}\n")
+
+                elif msg_type == "DETECTION_CONFIRM_REQUEST":
+                    # Another drone is asking us to confirm an issue detection
+                    issue = msg.get("issue_type", "UNKNOWN")
+                    conf = msg.get("confidence_score")
+                    location = msg.get("location", {})
+                    print(f"\n{'='*60}")
+                    print(f"[DRONE] 🔎 DETECTION CONFIRM REQUEST RECEIVED")
+                    print(f"[DRONE] From: {msg.get('sender_id', 'UNKNOWN')} at {addr[0]}")
+                    print(f"[DRONE] Issue: {issue}")
+                    if conf is not None:
+                        print(f"[DRONE] Sender confidence: {float(conf):.2%}")
+                    if location:
+                        print(f"[DRONE] Location: X={location.get('x', 0):.2f}m, Y={location.get('y', 0):.2f}m, Z={location.get('z', 0):.2f}m")
+                        print(f"[DRONE] Yaw: {location.get('yaw', 0):.4f} rad")
+                    print(f"[DRONE] Action: perform visual confirmation and respond (not automated here)")
+                    print(f"{'='*60}\n")
+                
+                elif msg_type == "DRONE_HANDOVER_ACK" and sender_role == "DRONE":
+                    # Response to a handover request (could be ours or another drone's)
+                    responder_drone_id = msg.get("sender_id")
+                    responder_ip = msg.get("responder_ip") or msg.get("sender_ip") or addr[0]
+                    target_drone_id = msg.get("target_drone_id")
+                    message_id = msg.get("message_id")  # The message_id this ACK is for
+                    
+                    # Mark this message_id as acknowledged (so other drones stop responding)
+                    if message_id:
+                        with handover_ack_lock:
+                            acknowledged_handover_ids.add(message_id)
+                    
+                    # If this ACK is for our request
+                    if target_drone_id == DRONE_ID:
+                        print(f"\n{'='*60}")
+                        print(f"[DRONE] ✅ RECEIVED HANDOVER RESPONSE ACK")
+                        print(f"[DRONE] Message ID: {message_id}")
+                        print(f"[DRONE] From: {responder_drone_id} at {addr[0]}")
+                        print(f"[DRONE] Responder IP: {responder_ip}")
+                        print(f"[DRONE] Status: {msg.get('status')}, Battery: {msg.get('battery_pct')}%")
+                        print(f"[DRONE] Replacement drone available at IP: {responder_ip}")
+                        print(f"{'='*60}\n")
+                    else:
+                        # This ACK is for another drone's request - just acknowledge we received it
+                        print(f"[DRONE] 📨 Received handover ACK for {target_drone_id} (message_id: {message_id})")
+                        print(f"[DRONE]    Responder: {responder_drone_id} at {responder_ip}")
+                        print(f"[DRONE]    This message_id is now marked as acknowledged\n")
+                
+            except json.JSONDecodeError as e:
+                print(f"[DRONE] ⚠️  Error decoding JSON message from {addr}: {e}")
+            except Exception as e:
+                print(f"[DRONE] ⚠️  Error processing message from {addr}: {e}")
+                
+    except Exception as e:
+        print(f"[DRONE] ❌ UDP message listener failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
-	main()
+    print(f"\n{'='*60}")
+    print(f"[DRONE] Starting {DRONE_ID}")
+    print(f"[DRONE] Local IP: {LOCAL_IP}")
+    print(f"[DRONE] Battery Status: {battery_pct}%")
+    print(f"{'='*60}\n")
+    
+    # Start UDP message listener (handles base station ACK, simulations, and handover requests)
+    threading.Thread(target=udp_message_listener, daemon=True).start()
+    
+    # Start heartbeat sender thread
+    threading.Thread(target=heartbeat_sender, daemon=True).start()
+    
+    # Start battery monitor thread (automatically checks battery and broadcasts replacement when low)
+    threading.Thread(target=battery_monitor, daemon=True).start()
+    
+    # Wait for listener to start
+    time.sleep(1)
+    
+    # Send discovery broadcast to join network
+    print(f"[DRONE] Broadcasting discovery to join network...")
+    if send_discovery_broadcast():
+        print(f"[DRONE] Discovery broadcast sent, waiting for base station ACK...")
+    else:
+        print(f"[DRONE] Failed to send discovery broadcast")
+    
+    try:
+        while True:
+            time.sleep(10)
+            # Keep running
+    except KeyboardInterrupt:
+        print(f"\n[DRONE] Shutting down {DRONE_ID}...")
