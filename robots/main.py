@@ -93,15 +93,12 @@ def log(msg: str) -> None:
 
 
 def init_serial() -> bool:
-	"""Initialize serial connection to Arduino for WAITER robot"""
+	"""Initialize serial connection to Arduino for WAITER and FIXER robots"""
 	global ser
 	
 	if not SERIAL_AVAILABLE:
 		log("❌ pyserial not installed; cannot communicate with Arduino")
 		log("   Install with: pip install pyserial")
-		return False
-	
-	if ROBOT_TYPE != "WAITER":
 		return False
 	
 	try:
@@ -118,8 +115,8 @@ def init_serial() -> bool:
 
 
 def send_command(letter: str, duration: float) -> None:
-	"""Send a command to Arduino for specified duration"""
-	if not SERIAL_AVAILABLE or ROBOT_TYPE != "WAITER":
+	"""Send a command to Arduino for specified duration (works for both WAITER and FIXER)"""
+	if not SERIAL_AVAILABLE:
 		return
 	
 	if not init_serial():
@@ -200,7 +197,7 @@ def send_part_request(issue_type: str):
 
 def move_to_tower_and_fix():
 	"""FIXER: Move robot to tower, request parts, and fix issue"""
-	global moving_to_tower, robot_status, current_issue_type
+	global moving_to_tower, robot_status, current_issue_type, part_request_active
 	
 	with movement_lock:
 		if moving_to_tower:
@@ -215,15 +212,10 @@ def move_to_tower_and_fix():
 	log(f"{'='*60}\n")
 	
 	try:
-		# Phase 1: Move to tower (simulated movement)
+		# Phase 1: Move to tower (using Arduino)
 		log("Phase 1: Moving to tower...")
 		log("🚗 FIXER IS MOVING TO TOWER")
-		movement_time = 0
-		movement_duration = 5  # Simulate 5 seconds of movement
-		while moving_to_tower and movement_time < movement_duration:
-			log(f"⬆️  FIXER IS MOVING FORWARD")
-			time.sleep(1)
-			movement_time += 1
+		send_command('F', 5.0)  # Move forward for 5 seconds
 		
 		log(f"\n{'='*60}")
 		log("✅ REACHED TOWER")
