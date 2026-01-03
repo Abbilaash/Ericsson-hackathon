@@ -10,7 +10,7 @@ ROLE = "DRONE"
 MESSAGE_PORT = 9999
 
 # UNIVERSAL STATUS
-USTATUS = 'ACTIVE'
+USTATUS = 'IDLE'
 
 def get_local_ip():
     try:
