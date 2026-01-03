@@ -169,11 +169,13 @@ def pm_arm(master: mavutil.mavfile, timeout: float = 15.0) -> None:
 
 
 def pm_rc_spin(master: mavutil.mavfile, throttle_pwm: int) -> None:
-    """Spin motors at specified throttle indefinitely until flight_active is False."""
+    """Spin motors at specified throttle until a GROUND command stops them."""
     global motors_spinning
     print(f"[PYMAVLINK] Spinning at {throttle_pwm} PWM (will continue until GROUND command)...")
     motors_spinning = True
-    while flight_active and motors_spinning:
+
+    # Keep motors spinning until explicitly grounded; do not auto-stop on flight loop state changes
+    while motors_spinning:
         master.mav.heartbeat_send(
             mavutil.mavlink.MAV_TYPE_GCS,
             mavutil.mavlink.MAV_AUTOPILOT_INVALID,
@@ -194,6 +196,7 @@ def pm_rc_spin(master: mavutil.mavfile, throttle_pwm: int) -> None:
             65535,
         )
         time.sleep(0.1)
+
     motors_spinning = False
 
 
