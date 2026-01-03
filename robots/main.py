@@ -11,6 +11,7 @@ import time
 from typing import Optional
 import os
 import platform
+import sys
 
 
 # RealSense imports - only needed for FIXER robots
@@ -28,6 +29,14 @@ try:
 except ImportError:
 	BATTERY_DETECTION_AVAILABLE = False
 	psutil = None
+
+# Arduino serial control (for WAITER activation)
+try:
+	import serial
+	SERIAL_AVAILABLE = True
+except ImportError:
+	SERIAL_AVAILABLE = False
+	serial = None
 
 
 ROLE = "ROBOT"
@@ -81,6 +90,13 @@ realsense_lock = threading.Lock()
 listener_ready = False
 listener_ready_lock = threading.Lock()
 
+# Arduino serial configuration (WAITER activation)
+ARDUINO_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")  # Override via env
+# Default 9600 baud to match Arduino sketch
+ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", "9600"))
+arduino_serial = None
+arduino_lock = threading.Lock()
+
 
 def now() -> float:
 	return time.time()
@@ -121,6 +137,80 @@ def init_realsense_camera():
 	# Only FIXER robots need camera
 	if ROBOT_TYPE != "FIXER":
 		return False
+
+
+def init_arduino_serial() -> bool:
+	"""Initialize serial connection to Arduino Nano for WAITER activation."""
+	global arduino_serial
+
+	if not SERIAL_AVAILABLE:
+		log("❌ pyserial not installed; cannot talk to Arduino")
+		log("   Install with: pip install pyserial")
+		return False
+
+	if ROBOT_TYPE != "WAITER":
+		return False
+
+	try:
+		with arduino_lock:
+			if arduino_serial and arduino_serial.is_open:
+				return True
+			arduino_serial = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+			log(f"✅ Arduino serial opened on {ARDUINO_PORT} @ {ARDUINO_BAUD}")
+			# Small delay to let Arduino reset
+			time.sleep(2)
+			return True
+	except Exception as exc:
+		log(f"❌ Failed to open Arduino serial on {ARDUINO_PORT}: {exc}")
+		return False
+
+
+def send_arduino_activation() -> None:
+	"""Send a simple activation command to Arduino to start the motors."""
+	if ROBOT_TYPE != "WAITER":
+		return
+
+	if not init_arduino_serial():
+		return
+
+	cmd = "ENGAGE\n"  # Arduino can interpret as activation trigger
+	try:
+		with arduino_lock:
+			arduino_serial.write(cmd.encode("utf-8"))
+			arduino_serial.flush()
+		log("🚀 Sent activation command to Arduino (ENGAGE)")
+	except Exception as exc:
+		log(f"❌ Failed to send activation to Arduino: {exc}")
+
+
+def run_waiter_drive_sequence() -> None:
+	"""Execute forward-then-stop sequence on Arduino (WAITER only)."""
+	if ROBOT_TYPE != "WAITER":
+		return
+	if not SERIAL_AVAILABLE:
+		log("❌ pyserial not installed; cannot drive Arduino")
+		return
+	try:
+		# Open serial fresh for the sequence
+		with arduino_lock:
+			ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+			log(f"✅ Opened Arduino serial {ARDUINO_PORT} @ {ARDUINO_BAUD}")
+			# Allow Arduino reset
+			time.sleep(2)
+			log("➡️  Sending forward command 'F'")
+			ser.write(b'F')
+			ser.flush()
+		log("🚚 Robot moving forward for 5s...")
+		time.sleep(5)
+		with arduino_lock:
+			log("🛑 Sending stop command 'S'")
+			ser.write(b'S')
+			ser.flush()
+			time.sleep(0.1)
+			ser.close()
+		log("✅ Drive sequence complete; serial closed")
+	except Exception as exc:
+		log(f"❌ Arduino drive sequence failed: {exc}")
 	
 	if not REALSENSE_AVAILABLE:
 		log("❌ RealSense library not installed (pyrealsense2)")
@@ -453,6 +543,9 @@ def handle_part_request(msg: dict) -> None:
 	log(f"From FIXER: {fixer_id}")
 	log(f"Issue Type: {issue_type}")
 	log(f"{'='*60}\n")
+
+	# Activate Arduino drive when WAITER is engaged
+	send_arduino_activation()
 	
 	# Send ACK to base station
 	log("Sending ACK to base station...")
@@ -632,6 +725,9 @@ def handle_control(msg: dict) -> None:
 	log(f"Received control command: {cmd}")
 	if cmd == "ENGAGE":
 		robot_status = "BUSY"
+		# For WAITER robots, run Arduino drive sequence (forward then stop)
+		if ROBOT_TYPE == "WAITER":
+			threading.Thread(target=run_waiter_drive_sequence, daemon=True).start()
 	elif cmd == "GROUND":
 		robot_status = "INACTIVE"
 	else:
@@ -666,6 +762,10 @@ def handle_packet(msg: dict, addr) -> None:
 	
 	if msg_type == "PART_DELIVERY_ACK":
 		handle_part_delivery_ack(msg)
+		return
+
+	if msg_type == "DRONE_CONTROL":
+		handle_control(msg)
 		return
 
 	if msg_type == "REQUEST" or msg_type == "TASK":
