@@ -96,6 +96,8 @@ ARDUINO_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")  # Override via env
 ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", "9600"))
 arduino_serial = None
 arduino_lock = threading.Lock()
+waiter_active = False  # Control flag for WAITER continuous operation
+waiter_lock = threading.Lock()
 
 
 def now() -> float:
@@ -136,6 +138,41 @@ def init_realsense_camera():
 	
 	# Only FIXER robots need camera
 	if ROBOT_TYPE != "FIXER":
+		return False
+
+	if not REALSENSE_AVAILABLE:
+		log("❌ RealSense library not installed (pyrealsense2)")
+		log("   On Ubuntu, install: pip install pyrealsense2")
+		return False
+
+	# Check if devices are available
+	if not detect_realsense_devices():
+		log("❌ No RealSense camera detected")
+		log("   On Ubuntu, check: lsusb | grep RealSense")
+		log("   Or run: sudo udevadm control --reload-rules")
+		return False
+
+	try:
+		with realsense_lock:
+			pipeline = rs.pipeline()
+			config = rs.config()
+			
+			# Configure depth and color streams
+			config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+			config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+			
+			# Start streaming
+			pipeline.start(config)
+			realsense_pipeline = pipeline
+			
+			log("✅ RealSense D455 camera initialized successfully")
+			return True
+	except Exception as exc:
+		log(f"❌ Failed to initialize RealSense camera: {exc}")
+		if "Permission denied" in str(exc) or "libusb" in str(exc):
+			log("   Try: sudo python3 robots/main.py")
+		if "IPC" in str(exc) or "USB" in str(exc):
+			log("   Check USB connection and permissions on Ubuntu")
 		return False
 
 
@@ -184,68 +221,40 @@ def send_arduino_activation() -> None:
 
 
 def run_waiter_drive_sequence() -> None:
-	"""Execute forward-then-stop sequence on Arduino (WAITER only)."""
+	"""Continuously send 'B' command to Arduino until GROUND command stops it (WAITER only)."""
+	global waiter_active
+	
 	if ROBOT_TYPE != "WAITER":
 		return
 	if not SERIAL_AVAILABLE:
 		log("❌ pyserial not installed; cannot drive Arduino")
 		return
+	
 	try:
-		# Open serial fresh for the sequence
-		with arduino_lock:
-			ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
-			log(f"✅ Opened Arduino serial {ARDUINO_PORT} @ {ARDUINO_BAUD}")
-			# Allow Arduino reset
-			time.sleep(2)
-			log("➡️  Sending forward command 'F'")
-			ser.write(b'F')
+		ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+		# Allow Arduino reset
+		time.sleep(2)
+		
+		log("🔄 Starting continuous 'B' command transmission (will continue until GROUND)...")
+		with waiter_lock:
+			waiter_active = True
+		
+		# Continuously send 'B' until grounded
+		while waiter_active:
+			ser.write(b'B')
 			ser.flush()
-		log("🚚 Robot moving forward for 5s...")
-		time.sleep(5)
-		with arduino_lock:
-			log("🛑 Sending stop command 'S'")
-			ser.write(b'S')
-			ser.flush()
-			time.sleep(0.1)
-			ser.close()
-		log("✅ Drive sequence complete; serial closed")
+			log("📡 Sent 'B' command to Arduino")
+			time.sleep(0.5)  # Send every 500ms
+		
+		log("🛑 Stopping WAITER - closing serial connection")
+		ser.close()
+		log("✅ WAITER stopped; serial closed")
 	except Exception as exc:
 		log(f"❌ Arduino drive sequence failed: {exc}")
-	
-	if not REALSENSE_AVAILABLE:
-		log("❌ RealSense library not installed (pyrealsense2)")
-		log("   On Ubuntu, install: pip install pyrealsense2")
-		return False
-	
-	# Check if devices are available
-	if not detect_realsense_devices():
-		log("❌ No RealSense camera detected")
-		log("   On Ubuntu, check: lsusb | grep RealSense")
-		log("   Or run: sudo udevadm control --reload-rules")
-		return False
-	
-	try:
-		with realsense_lock:
-			pipeline = rs.pipeline()
-			config = rs.config()
-			
-			# Configure depth and color streams
-			config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-			config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-			
-			# Start streaming
-			pipeline.start(config)
-			realsense_pipeline = pipeline
-			
-			log("✅ RealSense D455 camera initialized successfully")
-			return True
-	except Exception as exc:
-		log(f"❌ Failed to initialize RealSense camera: {exc}")
-		if "Permission denied" in str(exc) or "libusb" in str(exc):
-			log("   Try: sudo python3 robots/main.py")
-		if "IPC" in str(exc) or "USB" in str(exc):
-			log("   Check USB connection and permissions on Ubuntu")
-		return False
+	finally:
+		with waiter_lock:
+			waiter_active = False
+
 
 
 def get_distance_to_tower():
@@ -356,6 +365,7 @@ def move_to_tower_and_fix():
 	try:
 		# Phase 1: Move to tower
 		log("Phase 1: Moving to tower...")
+		log("🚗 FIXER IS MOVING TO TOWER")
 		while moving_to_tower:
 			distance_cm = get_distance_to_tower()
 			
@@ -374,7 +384,7 @@ def move_to_tower_and_fix():
 				break
 			
 			elif distance_cm > TARGET_DISTANCE_CM + DISTANCE_TOLERANCE_CM:
-				log(f"⬆️  Moving forward (distance: {distance_cm:.1f}cm)")
+				log(f"⬆️  FIXER IS MOVING FORWARD (distance: {distance_cm:.1f}cm)")
 				# TODO: Send actual motor control commands here
 				time.sleep(0.5)
 			else:
@@ -432,8 +442,9 @@ def deliver_parts_to_fixer(fixer_id: str, issue_type: str):
 	try:
 		# Simulate movement to fixer
 		log("🚚 Moving to FIXER location...")
+		log("🚗 WAITER IS MOVING FORWARD TO DELIVER PARTS")
 		for i in range(int(PART_DELIVERY_TIME_SEC)):
-			log(f"Delivering... {i+1}/{int(PART_DELIVERY_TIME_SEC)}s")
+			log(f"🚗 WAITER IS MOVING FORWARD - Delivering... {i+1}/{int(PART_DELIVERY_TIME_SEC)}s")
 			time.sleep(1)
 		
 		log(f"\n✅ Parts delivered to {fixer_id}")
@@ -717,7 +728,7 @@ def send_task_ack(task_id: Optional[str]) -> None:
 
 
 def handle_control(msg: dict) -> None:
-	global robot_status
+	global robot_status, waiter_active
 	command = msg.get("command") or msg.get("action")
 	if not command:
 		return
@@ -725,13 +736,54 @@ def handle_control(msg: dict) -> None:
 	log(f"Received control command: {cmd}")
 	if cmd == "ENGAGE":
 		robot_status = "BUSY"
-		# For WAITER robots, run Arduino drive sequence (forward then stop)
+		# For WAITER robots, start continuous 'B' transmission
 		if ROBOT_TYPE == "WAITER":
 			threading.Thread(target=run_waiter_drive_sequence, daemon=True).start()
 	elif cmd == "GROUND":
 		robot_status = "INACTIVE"
+		# Stop WAITER continuous operation
+		if ROBOT_TYPE == "WAITER":
+			with waiter_lock:
+				waiter_active = False
+			log("🛬 GROUND command received - stopping WAITER")
 	else:
 		robot_status = robot_status
+
+
+def handle_return_home(msg: dict) -> None:
+	"""WAITER: Send 'F' command for 10 seconds to return home"""
+	if ROBOT_TYPE != "WAITER":
+		log("RETURN_HOME only applicable to WAITER robots - ignoring")
+		return
+	
+	log(f"\n{'='*60}")
+	log("🏠 RETURN_HOME command received")
+	log("Sending 'F' command for 10 seconds...")
+	log(f"{'='*60}\n")
+	
+	if not SERIAL_AVAILABLE:
+		log("❌ pyserial not installed; cannot send return home command")
+		return
+	
+	def _send_return_home():
+		try:
+			ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+			time.sleep(2)  # Allow Arduino reset
+			
+			log("➡️  Starting return home sequence (F for 10s)")
+			start_time = time.time()
+			while time.time() - start_time < 10.0:
+				ser.write(b'F')
+				ser.flush()
+				time.sleep(0.5)  # Send every 500ms
+			
+			log("✅ Return home sequence complete (10s elapsed)")
+			ser.close()
+		except Exception as exc:
+			log(f"❌ Return home command failed: {exc}")
+	
+	# Run in separate thread to avoid blocking
+	threading.Thread(target=_send_return_home, daemon=True).start()
 
 
 def handle_packet(msg: dict, addr) -> None:
@@ -739,14 +791,25 @@ def handle_packet(msg: dict, addr) -> None:
 	sender_id = msg.get("sender_id")
 	sender_role = msg.get("sender_role", "").upper()
 	
-	# Print all received messages for visibility
-	print(f"\n{'='*60}")
-	print(f"[ROBOT] 📨 RECEIVED MESSAGE")
-	print(f"[ROBOT] From: {addr[0]}:{addr[1]}")
-	print(f"[ROBOT] Message Type: {msg_type}")
-	print(f"[ROBOT] Sender ID: {sender_id or 'UNKNOWN'}")
-	print(f"[ROBOT] Sender Role: {sender_role or 'UNKNOWN'}")
-	print(f"{'='*60}\n")
+	# Print all received messages for visibility (FIXER robots print full message)
+	if ROBOT_TYPE == "FIXER":
+		print(f"\n{'='*60}")
+		print(f"[ROBOT] 📨 RECEIVED MESSAGE (FIXER)")
+		print(f"[ROBOT] From: {addr[0]}:{addr[1]}")
+		print(f"[ROBOT] Message Type: {msg_type}")
+		print(f"[ROBOT] Sender ID: {sender_id or 'UNKNOWN'}")
+		print(f"[ROBOT] Sender Role: {sender_role or 'UNKNOWN'}")
+		print(f"[ROBOT] Full Message:")
+		print(json.dumps(msg, indent=2))
+		print(f"{'='*60}\n")
+	else:
+		print(f"\n{'='*60}")
+		print(f"[ROBOT] 📨 RECEIVED MESSAGE")
+		print(f"[ROBOT] From: {addr[0]}:{addr[1]}")
+		print(f"[ROBOT] Message Type: {msg_type}")
+		print(f"[ROBOT] Sender ID: {sender_id or 'UNKNOWN'}")
+		print(f"[ROBOT] Sender Role: {sender_role or 'UNKNOWN'}")
+		print(f"{'='*60}\n")
 	
 	if msg_type == "BASE_STATION_ACK":
 		handle_base_station_ack(msg)
@@ -766,6 +829,10 @@ def handle_packet(msg: dict, addr) -> None:
 
 	if msg_type == "DRONE_CONTROL":
 		handle_control(msg)
+		return
+
+	if msg_type == "RETURN_HOME":
+		handle_return_home(msg)
 		return
 
 	if msg_type == "REQUEST" or msg_type == "TASK":
