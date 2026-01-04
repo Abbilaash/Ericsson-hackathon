@@ -77,9 +77,11 @@ current_issue_type = None  # Store current issue being fixed
 listener_ready = False
 listener_ready_lock = threading.Lock()
 
-# Serial configuration for WAITER robot
-SERIAL_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")  # Override via env
-BAUD_RATE = 9600
+# Serial configuration - separate for WAITER and FIXER robots
+WAITER_SERIAL_PORT = os.getenv("WAITER_ARDUINO_PORT", "/dev/ttyUSB0")  # Override via env
+WAITER_BAUD_RATE = 115200
+FIXER_SERIAL_PORT = os.getenv("FIXER_ARDUINO_PORT", "/dev/ttyUSB1")  # Override via env
+FIXER_BAUD_RATE = 115200
 ser = None
 serial_lock = threading.Lock()
 
@@ -101,13 +103,24 @@ def init_serial() -> bool:
 		log("   Install with: pip install pyserial")
 		return False
 	
+	# Select port and baud rate based on robot type
+	if ROBOT_TYPE == "WAITER":
+		serial_port = WAITER_SERIAL_PORT
+		baud_rate = WAITER_BAUD_RATE
+	elif ROBOT_TYPE == "FIXER":
+		serial_port = FIXER_SERIAL_PORT
+		baud_rate = FIXER_BAUD_RATE
+	else:
+		log(f"❌ Unknown robot type: {ROBOT_TYPE}")
+		return False
+	
 	try:
 		with serial_lock:
 			if ser and ser.is_open:
 				return True
-			ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+			ser = serial.Serial(serial_port, baud_rate, timeout=1)
 			time.sleep(2)  # Wait for Arduino to reboot after connection
-			log(f"✅ Connected to Arduino Nano on {SERIAL_PORT}")
+			log(f"✅ Connected to Arduino Nano on {serial_port} at {baud_rate} baud")
 			return True
 	except Exception as e:
 		log(f"❌ Error connecting to Serial: {e}")
